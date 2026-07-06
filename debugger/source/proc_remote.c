@@ -527,6 +527,7 @@ struct arena_pid {
     uint32_t          pid;
     struct arena_seg *segs;
     struct arena_blk *freelist;
+    uint64_t          next_seg_size;   /* grow-on-demand target; 0 = use request size */
 };
 static struct arena_pid g_arenas[ARENA_NPID];
 static int g_arena_enabled = 1;
@@ -543,7 +544,7 @@ static struct arena_pid *arena_get(uint32_t pid) {
     struct arena_pid *ap = &g_arenas[slot];
     for (struct arena_seg *s = ap->segs; s; ) { struct arena_seg *n = s->next; free(s); s = n; }
     for (struct arena_blk *b = ap->freelist; b; ) { struct arena_blk *n = b->next; free(b); b = n; }
-    ap->inuse = 1; ap->pid = pid; ap->segs = 0; ap->freelist = 0;
+    ap->inuse = 1; ap->pid = pid; ap->segs = 0; ap->freelist = 0; ap->next_seg_size = 0;
     return ap;
 }
 
@@ -600,9 +601,34 @@ static int arena_alloc(uint32_t pid, uint64_t length, uint64_t *out) {
     for (struct arena_seg *s = ap->segs; s; s = s->next)
         if (s->size - s->used >= size) { *out = s->base + s->used; s->used += size; return 0; }
 
-    uint64_t seg_size = (size > ARENA_CHUNK) ? size : ARENA_CHUNK;
+    /* Segment sizing (grow-on-demand): start at EXACTLY the request size - no
+       speculative over-reservation, so the first fill for a pid is a single
+       small hijack, identical exposure to the pre-arena path (proven safe on
+       exec-tight games). Grow geometrically as a pid keeps allocating so heavy
+       clients still amortize to few hijacks. NEVER a speculative failing probe:
+       a single-shot miss retreats to the request size and stops growing this
+       pid (a failing probe is a hijack that can catch a lock-holding thread). */
+    uint64_t want = ap->next_seg_size;
+    if (want < size)        want = size;
+    if (want > ARENA_CHUNK) want = ARENA_CHUNK;
+
+    uint64_t seg_size = want;
     uint64_t base = 0;
-    if (do_real_alloc(pid, &base, seg_size, 0x4000) != 0) return -1;
+    int got = 0;
+    {
+        void *p = (void *)(uintptr_t)0x4000;
+        if (sys_proc_alloc(pid, &p, seg_size) == 0) { base = (uint64_t)(uintptr_t)p; got = 1; }
+    }
+    if (!got) {
+        /* Retreat to exactly the request size (the proven-safe, 1-hijack size)
+           with one backoff retry for transient contention, and freeze growth
+           for this pid so we never repeat a speculative probe. */
+        seg_size = size;
+        if (do_real_alloc(pid, &base, seg_size, 0x4000) != 0) return -1;
+        ap->next_seg_size = size;
+    } else {
+        ap->next_seg_size = (seg_size < ARENA_CHUNK) ? (seg_size << 1) : ARENA_CHUNK;
+    }
     struct arena_seg *s = (struct arena_seg *)malloc(sizeof(*s));
     if (!s) { *out = base; return 0; }
     s->base = base; s->size = seg_size; s->used = size; s->next = ap->segs; ap->segs = s;
