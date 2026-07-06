@@ -130,7 +130,7 @@ itself.
   AOB scans do not.
 
 ### Turbo scan family (v1.3.0, additive + capability-gated)
-A faster, opt-in scan path (`CMD_PROC_TURBOSCAN_*`, `0xBDAACC10`-`0xBDAACC16`) that
+A faster, opt-in scan path (`CMD_PROC_TURBOSCAN_*`, `0xBDAACC10`-`0xBDAACC17`) that
 runs alongside the legacy and iterative scanners, which are byte-for-byte
 unchanged. A client detects it via `CMD_PROC_TURBOSCAN_CAPS` and falls back to the
 iterative trio when it (or a specific engine) is absent. Result format mirrors the
@@ -187,7 +187,10 @@ iterative scan, so clients reuse one parser.
   anything - exclusion is the client's opt-in, user-overridable decision, default scan
   everything. The opcode is a raw literal (no `CMD_*` macro) so the enumerated `CMD_*`
   set stays unchanged.
-- **Auth-gated** - `TURBOSCAN_START` / `_COUNT` / `_GET` / `_END` require the
+- **Cancel** (`0xBDAACC17`, v1.3.1) - abort a long scan mid-flight (e.g. an unknown-value
+  snapshot over a huge region). Sent from a second connection, since the scanning
+  connection is busy streaming; a cancelled snapshot create returns `snapshot_ok=0`.
+- **Auth-gated** - `TURBOSCAN_START` / `_COUNT` / `_GET` / `_END` / `_CANCEL` require the
   `CMD_PROC_AUTH` handshake (like the iterative trio); `TURBOSCAN_CAPS` does not.
 
 ### System UI integration
@@ -346,7 +349,7 @@ elfldr from etaHEN-class loaders).
 You should see a system notification confirming the payload is alive:
 
 ```
-ps5debug-NG by OSR v1.3.0 loaded!
+ps5debug-NG by OSR v1.3.1 loaded!
 Firmware: 9.00
 Coded by OpenSourcereR
 Special thanks to

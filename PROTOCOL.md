@@ -7,7 +7,7 @@ the sources under `debugger/source/`, `common/`, and the client
 value and the on-the-wire value differ (see the bit-swap note in 1.6), both are
 given.
 
-This document reflects `ps5debug-NG v1.3.0` (`common/include/version.h`,
+This document reflects `ps5debug-NG v1.3.1` (`common/include/version.h`,
 `PS5DEBUG_NG_VERSION_STR`). The on-wire **protocol** version reported by
 `CMD_VERSION` is a separate string, currently `"1.3"`.
 
@@ -20,7 +20,7 @@ This document reflects `ps5debug-NG v1.3.0` (`common/include/version.h`,
 | Symbol             | Value                            | Source                                                   |
 |--------------------|----------------------------------|----------------------------------------------------------|
 | protocol version   | `"1.3"`                          | `meta.c` `handle_version` (local `char ver[]="1.3"`)     |
-| branding string    | `"ps5debug-NG by OSR v1.3.0\01.0"` | `version.h` `PS5DEBUG_NG_BRAND_STR` via `meta.c` `handle_branding` (NUL-separated capability level appended - see 2.1) |
+| branding string    | `"ps5debug-NG by OSR v1.3.1\01.0"` | `version.h` `PS5DEBUG_NG_BRAND_STR` via `meta.c` `handle_branding` (NUL-separated capability level appended - see 2.1) |
 | `PACKET_MAGIC`     | `0xFFAABBCC`                     | `main.c:50` (local `#define`)                            |
 | broadcast magic    | `0xFFFFAAAA`                     | `main.c` `broadcast_thread` (raw literal)                |
 | auth magic         | `0xBB40E64D`                     | `protocol.h:249` (`CMD_PROC_AUTH_MAGIC`)                 |
@@ -224,7 +224,7 @@ per-namespace `switch` statements. Three opcodes have no symbolic name at all:
 #### `CMD_BRANDING = 0xBD000501`
 - **Request body:** none.
 - **Response:** `uint32_t length`, then `length` bytes: the human branding string
-  (`"ps5debug-NG by OSR v1.3.0"`), a single `NUL`, then a **capability level**
+  (`"ps5debug-NG by OSR v1.3.1"`), a single `NUL`, then a **capability level**
   string (`"1.0"`), with no trailing NUL. No status word precedes it. (The client
   calls this `CMD_EXT_VERSION`.)
 - **Capability level:** C-string clients read up to the first `NUL` and see only
@@ -526,7 +526,7 @@ Bulk memory fetch for a candidate list. (Client name: `CMD_PROC_READ_MULTI`.)
   concatenated in order, then a `0xFFFFFFFFFFFFFFFF` sentinel. (Returns raw
   memory, not addresses.)
 
-#### TURBOSCAN family - `0xBDAACC10`-`0xBDAACC16` (`scan_turbo.c`)
+#### TURBOSCAN family - `0xBDAACC10`-`0xBDAACC17` (`scan_turbo.c`)
 
 Additive turbo-scan path (v1.3.0). The legacy (`0xBDAA0009`), AOB
 (`0501`/`0502`), and iterative (`CC01`/`02`/`03`) scans are unchanged; a client
@@ -740,6 +740,26 @@ everything). The opcode is deliberately a raw literal (no `CMD_*` macro) so the 
   Each record: `{ u64 start; u64 end; u32 prot; u32 flags; u32 mbps; u32 reserved; }`
   where `flags` bit0 = leaf-PTE `PCD=1` (uncached) and `mbps` is the measured whole-MB/s
   read throughput of the region. Read-only; no aliasing / PTE writes.
+
+##### `0xBDAACC17` - cancel (`proc_turboscan_cancel_handle`) - **requires auth bit 1**
+Abort an in-flight turbo scan (`START` or `COUNT`) for a given pid. The command dispatcher
+is serial per connection, so the connection running the long scan is busy streaming and
+cannot receive a command - **CANCEL must be sent on a second, separately authed
+connection**. It arms a pid-scoped flag the scan loops poll (all parallel workers observe
+it), so they stop early and emit their normal terminator; the waiting client on the first
+connection then unblocks. Raw literal (no `CMD_*` macro).
+- **Request body:** `u32 pid` (the pid whose in-flight scan to cancel; must be non-zero).
+- **Response:** `CMD_SUCCESS` (the flag is armed - it does not wait for the scan to notice).
+  `CMD_DATA_NULL` if not authed / no body / `pid == 0`.
+- **Effect on the cancelled scan:**
+  - **Snapshot `START` (unknown-initial-value):** stops cleanly, frees the half-built
+    snapshot, and returns the snapshot summary with `snapshot_ok = 0`.
+  - **`START` (known-value) and `COUNT` (rescan):** stop early and return their normal
+    terminator with **partial** results; the resident/snapshot session is left
+    **indeterminate** - issue `END` (`0xBDAACC14`) or a fresh `START` before trusting results.
+- **Staleness:** a cancel arriving before the scan starts is discarded (`START`/`COUNT`
+  clear a stale same-pid flag on entry), so only a running scan can be cancelled. The
+  client-driven streaming `COUNT` is already stoppable via its end sentinel and is unaffected.
 
 ##### Snapshot sub-protocol (`CC11 + TS_SNAPSHOT`, narrowed by `CC12 + TS_SERVER_RESIDENT`)
 For unknown-initial-value scans. **By default the seed drops all-zero slots** (most
@@ -1069,6 +1089,7 @@ Auth = requires `g_proc_auth_state & 2` (set via `CMD_PROC_AUTH`).
 | `0xBDAACC14` | `proc_turboscan_end_handle`       | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC15` | `proc_turboscan_config_handle`    | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC16` | `proc_turboscan_regions_handle`   | `scan_turbo.c`            | bit 1 |
+| `0xBDAACC17` | `proc_turboscan_cancel_handle`    | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC24` | `proc_arena_handle`              | `proc.c`                 |       |
 | `0xBDBB0001` | `debug_attach_handle`            | `debug.c`                |       |
 | `0xBDBB0002` | `debug_detach_handle`            | `debug.c`                |       |
@@ -1298,7 +1319,8 @@ Documented so a developer does not mistake them for bugs:
 
 ---
 
-*This document reflects the `ps5debug-NG v1.3.0` payload
-(`common/include/version.h`). Line numbers cite the sources as of this writing
+*This document reflects the `ps5debug-NG v1.3.1` payload
+(`common/include/version.h`; v1.3.1 added the Turbo Scan cancel command `0xBDAACC17`).
+Line numbers cite the sources as of this writing
 and may drift; the source under `common/include/protocol.h`,
 `debugger/source/`, and `common/source/` is the authoritative reference.*
