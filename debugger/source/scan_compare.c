@@ -94,8 +94,8 @@ bool aob_match(uint64_t pattern_length,
     case 8: return *(const float    *)P_MEM == (*(const float    *)P_BASE OP_BIN *(const float    *)P_DELTA); \
     case 9: {                                                                   \
                                                        \
-        double delta_as_float = (double)(*(const float *)P_DELTA);              \
-        return *(const double *)P_MEM == (*(const double *)P_BASE OP_BIN delta_as_float); \
+        double delta_d = *(const double *)P_DELTA;                              \
+        return *(const double *)P_MEM == (*(const double *)P_BASE OP_BIN delta_d); \
     }                                                                           \
     default: return false;                                                      \
     }

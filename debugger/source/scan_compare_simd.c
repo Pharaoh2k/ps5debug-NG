@@ -103,8 +103,8 @@ size_t scan_simd_find_exact(unsigned char valtype, const uint8_t *buf, size_t le
     case 6: return *(const uint64_t *)P_MEM == (*(const uint64_t *)P_BASE OP_BIN *(const uint64_t *)P_DELTA); \
     case 7: return *(const int64_t  *)P_MEM == (*(const int64_t  *)P_BASE OP_BIN *(const int64_t  *)P_DELTA); \
     case 8: return *(const float    *)P_MEM == (*(const float    *)P_BASE OP_BIN *(const float    *)P_DELTA); \
-    case 9: { double delta_as_float = (double)(*(const float *)P_DELTA);                                     \
-              return *(const double *)P_MEM == (*(const double *)P_BASE OP_BIN delta_as_float); }            \
+    case 9: { double delta_d = *(const double *)P_DELTA;                                                     \
+              return *(const double *)P_MEM == (*(const double *)P_BASE OP_BIN delta_d); }                   \
     default: return 0;                                                          \
     }
 
