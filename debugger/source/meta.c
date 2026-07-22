@@ -97,6 +97,7 @@ void    *curdbgctx       = NULL;
 uint32_t g_debug_attached = 0;
 void    *g_server_mutex  = NULL;
 void    *g_proc_rw_mutex = NULL;
+void    *g_debug_arbiter_mutex = NULL;
 void    *kr_fast_mutex   = NULL;
 
 uint32_t g_stopgo_mode          = 0;
@@ -105,12 +106,20 @@ uint32_t g_stopgo_last_signal   = 0xFFFFFFFFu;
 uint32_t g_stopgo_resume_pid    = 0;
 uint32_t g_stopgo_resume_signal = 0xFFFFFFFFu;
 
+volatile uint32_t g_debug_phase              = DEBUG_PHASE_DETACHED;
+volatile uint32_t g_debug_pending_wait_valid = 0;
+uint32_t          g_debug_pending_wait_pid   = 0;
+int32_t           g_debug_pending_wait_status = 0;
+
 void server_state_init(void) {
     if (g_proc_rw_mutex == NULL) {
         scePthreadMutexInit(&g_proc_rw_mutex, NULL, "ps5d_procrw");
     }
     if (g_server_mutex == NULL) {
         scePthreadMutexInit(&g_server_mutex, NULL, "ps5d_server");
+    }
+    if (g_debug_arbiter_mutex == NULL) {
+        scePthreadMutexInit(&g_debug_arbiter_mutex, NULL, "ps5d_debug_arbiter");
     }
     if (kr_fast_mutex == NULL) {
         scePthreadMutexInit(&kr_fast_mutex, NULL, "ps5d_krfast");
@@ -122,6 +131,10 @@ void server_state_init(void) {
     g_stopgo_last_signal   = 0xFFFFFFFFu;
     g_stopgo_target_pid    = 0;
     g_stopgo_mode          = 0;
+    g_debug_phase          = DEBUG_PHASE_DETACHED;
+    g_debug_pending_wait_valid = 0;
+    g_debug_pending_wait_pid   = 0;
+    g_debug_pending_wait_status = 0;
     curdbgcli              = NULL;
     curdbgctx              = NULL;
 }
@@ -151,7 +164,9 @@ void free_client(void *svc_) {
 
     close(svc->fd);
     if (svc->debugging != 0) {
+        scePthreadMutexLock(&g_debug_arbiter_mutex);
         debug_full_teardown(svc->dbgctx);
+        scePthreadMutexUnlock(&g_debug_arbiter_mutex);
     }
     memset(svc, 0, SERVER_CLIENT_STRIDE);
 }

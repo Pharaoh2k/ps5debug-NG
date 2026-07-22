@@ -23,18 +23,72 @@
 
 #define NID_LIBKERNEL_SYSCALL  "W0xkN0+ZkCE"
 
-static void *g_server_mutex = (void *)0;
-static int   g_server_mutex_init_done = 0;
+static void *g_proc_remote_mutex = (void *)0;
+static int   g_proc_remote_mutex_init_done = 0;
 
 static void mutex_lock(void)   {
-    if (!g_server_mutex_init_done) {
-        scePthreadMutexInit(&g_server_mutex, (void *)0, "proc_remote");
-        g_server_mutex_init_done = 1;
+    if (!g_proc_remote_mutex_init_done) {
+        scePthreadMutexInit(&g_proc_remote_mutex, (void *)0, "proc_remote");
+        g_proc_remote_mutex_init_done = 1;
     }
-    scePthreadMutexLock(&g_server_mutex);
+    scePthreadMutexLock(&g_proc_remote_mutex);
 }
-static void mutex_unlock(void) { scePthreadMutexUnlock(&g_server_mutex); }
+static void mutex_unlock(void) { scePthreadMutexUnlock(&g_proc_remote_mutex); }
 static void debugger_usleep(unsigned long us) { sceKernelUsleep((unsigned int)us); }
+
+#define RPC_WAIT_POLL_US 250u
+#define RPC_WAIT_POLLS   8000u
+
+static int rpc_wait4_bounded(int pid, int *out_status)
+{
+    int status = 0;
+    for (unsigned int i = 0; i < RPC_WAIT_POLLS; i++) {
+        int rc = wait4(pid, &status, 1, NULL);
+        if (rc > 0) {
+            if (out_status) *out_status = status;
+            return 1;
+        }
+        if (rc < 0) return -1;
+        debugger_usleep(RPC_WAIT_POLL_US);
+    }
+    return 0;
+}
+
+static uint8_t rpc_wait_signal(int status)
+{
+    return (uint8_t)((status >> 8) & 0xFF);
+}
+
+extern void *g_debug_arbiter_mutex;
+static int   g_rpc_arbiter_held = 0;
+static int   g_rpc_debug_target = 0;
+static int   g_rpc_broken = 0;
+
+static void rpc_arbiter_lock(void)
+{
+    if (!g_rpc_arbiter_held) {
+        scePthreadMutexLock(&g_debug_arbiter_mutex);
+        g_rpc_arbiter_held = 1;
+    }
+}
+
+static void rpc_arbiter_unlock(void)
+{
+    if (g_rpc_arbiter_held) {
+        g_rpc_arbiter_held = 0;
+        scePthreadMutexUnlock(&g_debug_arbiter_mutex);
+    }
+    g_rpc_debug_target = 0;
+    g_rpc_broken = 0;
+}
+
+static void rpc_mark_broken(void)
+{
+    if (g_rpc_debug_target) {
+        g_rpc_broken = 1;
+        g_debug_phase = DEBUG_PHASE_BROKEN;
+    }
+}
 
 extern long __crt_syscall(long sysno, ...);
 
@@ -189,20 +243,16 @@ int kern_ptrace_attach_and_wait(int pid)
 
     int wait_status = 0;
     *__error() = 0;
-    long wait_rc = ps5debug_syscall(7 , (long)pid, (long)&wait_status, 0L, 0L, 0L, 0L);
-    int  wait_errno = *__error();
+    int wait_rc = rpc_wait4_bounded(pid, &wait_status);
+    int wait_errno = *__error();
 
     if (!s_first_w4_diag) {
         s_first_w4_diag = 1;
-        klog_printf("[diag] kern_ptrace_attach_and_wait FIRST - pid=%d wait4 rc=%ld errno=%d status=0x%x\n",
+        klog_printf("[diag] kern_ptrace_attach_and_wait FIRST - pid=%d wait4 rc=%d errno=%d status=0x%x\n",
                     pid, wait_rc, wait_errno, wait_status);
     }
 
-    if (wait_rc == -1) {
-
-        sceKernelUsleep(20000);
-    }
-    return 0;
+    return (wait_rc == 1) ? 0 : -1;
 }
 
 static int resume_app_via_self_id(int pid)
@@ -222,26 +272,80 @@ struct dbgctx_pid { uint32_t pid; };
 
 int proc_rpc_stop_target(int wpid)
 {
+    rpc_arbiter_lock();
+    g_rpc_debug_target = 0;
+    g_rpc_broken = 0;
+
     struct dbgctx_pid *ctx = (struct dbgctx_pid *)curdbgctx;
     uint32_t state = g_stopgo_last_signal;
     int hit_second_kill = 0;
 
     if (ctx != NULL) {
         int target_pid = (int)ctx->pid;
+        if (target_pid == wpid) {
+            /* A debugger-visible stop belongs to the client. Continuing it here
+               would consume the breakpoint event and briefly run the game behind
+               the UI. Only a target known to be RUNNING may be borrowed for RPC. */
+            if (g_debug_phase != DEBUG_PHASE_RUNNING) {
+                rpc_arbiter_unlock();
+                return PROC_RPC_ERR_DEBUG_STATE;
+            }
+
+            g_rpc_debug_target = 1;
+
+            /* The command socket is serviced before the debug-event poll. An
+               event can therefore already be queued while the last published
+               phase is still RUNNING. Claim it before sending our SIGSTOP so
+               the normal dispatcher, not the RPC path, remains its owner. */
+            int pending_status = 0;
+            int pending_rc = wait4(wpid, &pending_status, 1, NULL);
+            if (pending_rc < 0) {
+                rpc_mark_broken();
+                rpc_arbiter_unlock();
+                return -1;
+            }
+            if (pending_rc > 0) {
+                g_debug_pending_wait_pid = (uint32_t)wpid;
+                g_debug_pending_wait_status = pending_status;
+                g_debug_pending_wait_valid = 1;
+                g_debug_phase = DEBUG_PHASE_EVENT_PENDING;
+                rpc_arbiter_unlock();
+                return PROC_RPC_ERR_DEBUG_STATE;
+            }
+
+            g_debug_phase = DEBUG_PHASE_RPC_ACTIVE;
+
+            if (kill(wpid, 0x11) != 0) {
+                rpc_mark_broken();
+                rpc_arbiter_unlock();
+                return -1;
+            }
+
+            int status = 0;
+            int wait_rc = rpc_wait4_bounded(wpid, &status);
+            if (wait_rc != 1) {
+                rpc_mark_broken();
+                rpc_arbiter_unlock();
+                return -1;
+            }
+
+            if (rpc_wait_signal(status) != 0x11) {
+                /* A breakpoint/watchpoint won the race with our SIGSTOP. Preserve
+                   the consumed wait status so dispatch_debug_events handles it on
+                   the normal callback path, then fail this RPC without retrying. */
+                g_debug_pending_wait_pid = (uint32_t)wpid;
+                g_debug_pending_wait_status = status;
+                g_debug_pending_wait_valid = 1;
+                g_debug_phase = DEBUG_PHASE_EVENT_PENDING;
+                rpc_arbiter_unlock();
+                return PROC_RPC_ERR_DEBUG_STATE;
+            }
+            return 0;
+        }
+
         if (state == 0x11 && g_stopgo_target_pid == (uint32_t)wpid) {
             resume_app_via_self_id(wpid);
-            if (target_pid == wpid) {
-                ptrace_elev(7 , wpid, (void *)1, 0);
-                kill(wpid, 0x11 );
-                waitpid(wpid, NULL, 0);
-                return 0;
-            }
             hit_second_kill = 1;
-        } else if (target_pid == wpid) {
-
-            kill(wpid, 0x11);
-            waitpid(wpid, NULL, 0);
-            return 0;
         }
     } else if (state == 0x11 && g_stopgo_target_pid == (uint32_t)wpid) {
         resume_app_via_self_id(wpid);
@@ -250,11 +354,19 @@ int proc_rpc_stop_target(int wpid)
 
     if (hit_second_kill) {
         kill(wpid, 0x13 );
-        waitpid(wpid, NULL, 0);
+        if (rpc_wait4_bounded(wpid, NULL) != 1) {
+            rpc_arbiter_unlock();
+            return -1;
+        }
     }
 
     int rc = kern_ptrace_attach_and_wait(wpid);
-    return rc ? -1 : 0;
+    if (rc != 0) {
+        (void)pt_detach(wpid);
+        rpc_arbiter_unlock();
+        return -1;
+    }
+    return 0;
 }
 
 int proc_detach_or_stop(int pid)
@@ -262,36 +374,37 @@ int proc_detach_or_stop(int pid)
     struct dbgctx_pid *ctx = (struct dbgctx_pid *)curdbgctx;
     uint32_t state = g_stopgo_last_signal;
 
-    if (ctx != NULL && (int)ctx->pid == pid) {
-        if (state == 0x11) {
-            uint32_t bound_pid = g_stopgo_target_pid;
-            resume_app_via_self_id(pid);
-            ptrace_elev(7 , pid, (void *)1, 0);
-            if (bound_pid != (uint32_t)pid) return 0;
-            kill(pid, 0x11);
-            waitpid(pid, NULL, 0);
-            return 0;
-        }
-
+    if (g_rpc_debug_target && ctx != NULL && (int)ctx->pid == pid) {
         resume_app_via_self_id(pid);
-        ptrace_elev(7, pid, (void *)1, 0);
-        return 0;
+        int rc = (int)ptrace_elev(7, pid, (void *)1, 0);
+        int failed = g_rpc_broken || rc != 0;
+        g_debug_phase = failed ? DEBUG_PHASE_BROKEN : DEBUG_PHASE_RUNNING;
+        rpc_arbiter_unlock();
+        return failed ? -1 : 0;
     }
 
     if (state == 0x11) {
         uint32_t bound_pid = g_stopgo_target_pid;
         resume_app_via_self_id(pid);
         int rc = pt_detach(pid);
-        if (rc != 0) return -1;
+        if (rc != 0) {
+            rpc_arbiter_unlock();
+            return -1;
+        }
         if (bound_pid == (uint32_t)pid) {
             kill(pid, 0x11);
-            waitpid(pid, NULL, 0);
+            if (rpc_wait4_bounded(pid, NULL) != 1) {
+                rpc_arbiter_unlock();
+                return -1;
+            }
         }
+        rpc_arbiter_unlock();
         return 0;
     }
 
     resume_app_via_self_id(pid);
     int rc = pt_detach(pid);
+    rpc_arbiter_unlock();
     return rc ? -1 : 0;
 }
 
@@ -337,8 +450,11 @@ uint64_t proc_call_remote_kern(int pid, uint64_t func_addr, ...)
         sys_proc_rw_w1((uint64_t)pid, target_rsp, 8, &kdata, 0);
     }
 
-    ptrace_elev(7 , pid, (void *)1, 0);
-    waitpid(pid, &status, 0);
+    if (ptrace_elev(7 , pid, (void *)1, 0) != 0
+        || rpc_wait4_bounded(pid, &status) != 1) {
+        rpc_mark_broken();
+        return (uint64_t)-1;
+    }
 
     if (ptrace_elev(0x21 , pid, modified_regs, 0) != 0)
         return (uint64_t)-1;
@@ -401,8 +517,10 @@ uint64_t proc_call_remote_sys(int pid, int sysno, ...)
     for (int retry = 0; retry < 3 && !success; retry++) {
         if (ptrace_elev(9 , step_pid, (void *)(uintptr_t)1, 0) != 0)
             return (uint64_t)-1;
-        if ((int)waitpid(pid, 0, 0) < 0)
+        if (rpc_wait4_bounded(pid, NULL) != 1) {
+            rpc_mark_broken();
             return (uint64_t)-1;
+        }
         if (ptrace_elev(0x21, pid, modified_regs, 0) != 0)
             return (uint64_t)-1;
         success = (*(uint64_t *)(modified_regs + PCRK_R_RSP) >
@@ -411,8 +529,10 @@ uint64_t proc_call_remote_sys(int pid, int sysno, ...)
     if (!success) {
         if (ptrace_elev(9, step_pid, (void *)(uintptr_t)1, 0) != 0)
             return (uint64_t)-1;
-        if ((int)waitpid(pid, 0, 0) < 0)
+        if (rpc_wait4_bounded(pid, NULL) != 1) {
+            rpc_mark_broken();
             return (uint64_t)-1;
+        }
         if (ptrace_elev(0x21, pid, modified_regs, 0) != 0)
             return (uint64_t)-1;
 
@@ -456,7 +576,8 @@ int sys_proc_alloc(uint32_t pid, void **out_addr_ptr, uint64_t length)
         return 0;
     }
 
-    if (proc_rpc_stop_target((int)pid) != 0) return -1;
+    int stop_rc = proc_rpc_stop_target((int)pid);
+    if (stop_rc != 0) return stop_rc;
 
     void *result = freebsd_mmap((unsigned long)pid, *out_addr_ptr,
                                  (unsigned long)length, 7, 0x1002, -1, 0);
@@ -486,7 +607,8 @@ int sys_proc_free(uint32_t pid, void *addr, uint64_t length)
         return munmap(addr, (size_t)length);
     }
 
-    if (proc_rpc_stop_target((int)pid) != 0) return -1;
+    int stop_rc = proc_rpc_stop_target((int)pid);
+    if (stop_rc != 0) return stop_rc;
 
     int rc = freebsd_munmap((int)pid, (unsigned long)(uintptr_t)addr,
                              (unsigned long)length);
@@ -498,7 +620,8 @@ int sys_proc_free(uint32_t pid, void *addr, uint64_t length)
 
 int sys_proc_call(int pid, struct sys_proc_call_args *args)
 {
-    if (proc_rpc_stop_target(pid) != 0) return -1;
+    int stop_rc = proc_rpc_stop_target(pid);
+    if (stop_rc != 0) return stop_rc;
 
     uint64_t ret = proc_call_remote_kern(
         pid, args->rip,
@@ -557,12 +680,20 @@ static struct arena_pid *arena_find(uint32_t pid) {
 static int do_real_alloc(uint32_t pid, uint64_t *out, uint64_t length, uint64_t hint) {
     void *p = (void *)(uintptr_t)hint;
     int rc = sys_proc_alloc(pid, &p, length);
+    if (rc == PROC_RPC_ERR_DEBUG_STATE) {
+        *out = (uint64_t)(uintptr_t)p;
+        return rc;
+    }
     if (rc != 0) {
         p = (void *)(uintptr_t)hint;
         debugger_usleep(40000);
         int retries = ALLOC_FILL_RETRIES;
         for (;;) {
             rc = sys_proc_alloc(pid, &p, length);
+            if (rc == PROC_RPC_ERR_DEBUG_STATE) {
+                *out = (uint64_t)(uintptr_t)p;
+                return rc;
+            }
             if (rc == 0) break;
             p = (void *)(uintptr_t)hint;
             debugger_usleep(40000);
@@ -575,11 +706,14 @@ static int do_real_alloc(uint32_t pid, uint64_t *out, uint64_t length, uint64_t 
 
 static int do_real_free(uint32_t pid, uint64_t addr, uint64_t length) {
     int rc = sys_proc_free(pid, (void *)(uintptr_t)addr, length);
+    if (rc == PROC_RPC_ERR_DEBUG_STATE) return rc;
     if (rc < 0) {
         int retries = 11;
         do {
             debugger_usleep(40000);
-            if (sys_proc_free(pid, (void *)(uintptr_t)addr, length) >= 0) { rc = 0; break; }
+            int retry_rc = sys_proc_free(pid, (void *)(uintptr_t)addr, length);
+            if (retry_rc == PROC_RPC_ERR_DEBUG_STATE) return retry_rc;
+            if (retry_rc >= 0) { rc = 0; break; }
         } while (--retries > 0);
     }
     return rc;
@@ -617,7 +751,9 @@ static int arena_alloc(uint32_t pid, uint64_t length, uint64_t *out) {
     int got = 0;
     {
         void *p = (void *)(uintptr_t)0x4000;
-        if (sys_proc_alloc(pid, &p, seg_size) == 0) { base = (uint64_t)(uintptr_t)p; got = 1; }
+        int alloc_rc = sys_proc_alloc(pid, &p, seg_size);
+        if (alloc_rc == PROC_RPC_ERR_DEBUG_STATE) return alloc_rc;
+        if (alloc_rc == 0) { base = (uint64_t)(uintptr_t)p; got = 1; }
     }
     if (!got) {
         /* Retreat to exactly the request size (the proven-safe, 1-hijack size)
@@ -690,11 +826,16 @@ int proc_remote_call(int pid, struct sys_proc_call_args *args)
     mutex_lock();
 
     int rc = sys_proc_call(pid, args);
+    if (rc == PROC_RPC_ERR_DEBUG_STATE) {
+        mutex_unlock();
+        return rc;
+    }
     if (rc != 0) {
         debugger_usleep(40000);
         int retries = 6;
         for (;;) {
             rc = sys_proc_call(pid, args);
+            if (rc == PROC_RPC_ERR_DEBUG_STATE) break;
             if (rc == 0) break;
             debugger_usleep(40000);
             if (--retries == 0) break;

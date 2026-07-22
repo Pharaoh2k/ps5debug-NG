@@ -772,7 +772,10 @@ int proc_call_handle(int fd, struct cmd_packet *packet) {
         args.r8      = cp->rpc_r8;
         args.r9      = cp->rpc_r9;
 
-        if (sys_proc_cmd(cp->pid, SYS_PROC_CALL, &args)) return -1;
+        if (sys_proc_cmd(cp->pid, SYS_PROC_CALL, &args)) {
+            net_send_int32(fd, CMD_ERROR);
+            return 0;
+        }
 
         resp.pid     = cp->pid;
         resp.rpc_rax = args.rax;
@@ -984,7 +987,10 @@ int proc_free_handle(int fd, struct cmd_packet *packet) {
         args.address = fp->address;
         args.length  = fp->length;
 
-        sys_proc_cmd(fp->pid, SYS_PROC_FREE, &args);
+        if (sys_proc_cmd(fp->pid, SYS_PROC_FREE, &args) != 0) {
+            net_send_int32(fd, CMD_ERROR);
+            return 0;
+        }
 
         net_send_int32(fd, CMD_SUCCESS);
         return 0;

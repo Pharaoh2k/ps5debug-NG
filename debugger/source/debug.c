@@ -24,6 +24,23 @@ extern uint32_t g_debug_attached;
 extern void    *g_server_mutex;
 extern void    *g_proc_rw_mutex;
 
+#define DEBUG_WAIT_POLL_US 250u
+#define DEBUG_WAIT_POLLS   8000u
+
+static int debug_wait4_bounded(int pid, int *out_status) {
+    int status = 0;
+    for (unsigned int i = 0; i < DEBUG_WAIT_POLLS; i++) {
+        int rc = wait4(pid, &status, 1, NULL);
+        if (rc > 0) {
+            if (out_status) *out_status = status;
+            return 1;
+        }
+        if (rc < 0) return -1;
+        sceKernelUsleep(DEBUG_WAIT_POLL_US);
+    }
+    return 0;
+}
+
 struct dbgctx {
     uint32_t pid;
     int      dbgfd;
@@ -205,8 +222,6 @@ struct cmd_debug_setreg_packet {
 #define DBGCTX() ((struct dbgctx *)curdbgctx)
 
 int connect_debugger(struct dbgctx *ctx, void *client_sockaddr_in) {
-    g_debug_attached = 1;
-
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -336,8 +351,14 @@ static void int3_iterative_sweep(int pid, const uint64_t *bp_addrs, int n_bps) {
 
 void debug_full_teardown(void *svc) {
     if (!g_debug_attached) {
+        g_debug_pending_wait_valid = 0;
+        g_debug_pending_wait_pid = 0;
+        g_debug_pending_wait_status = 0;
+        g_debug_phase = DEBUG_PHASE_DETACHED;
         return;
     }
+
+    g_debug_phase = DEBUG_PHASE_DETACHING;
 
     g_recently_disabled_count = 0;
 
@@ -373,6 +394,7 @@ void debug_full_teardown(void *svc) {
     int   alive_rc = sys_proc_vm_map((uint32_t)pid, &vm_maps, &vm_count);
     if (alive_rc != 0) {
         if (vm_maps) free(vm_maps);
+        ptrace_raw(PT_DETACH, pid, NULL, 0);
         goto close_socket_and_unlock;
     }
     if (vm_maps) free(vm_maps);
@@ -410,10 +432,12 @@ void debug_full_teardown(void *svc) {
         int rc = (int)ptrace_raw(PT_GETNUMLWPS, pid, NULL, 0);
         if (rc == -1) {
             if (errno != 16 ) {
-                goto teardown_done;
+                goto free_and_detach;
             }
-            kill(pid, 17 );
-            wait4(pid, NULL, 0, NULL);
+            if (kill(pid, 17) != 0
+                || debug_wait4_bounded(pid, NULL) != 1) {
+                goto free_and_detach;
+            }
             we_stopped = 1;
             ptrace_raw(PT_GETNUMLWPS, pid, NULL, 0);
         }
@@ -423,32 +447,30 @@ void debug_full_teardown(void *svc) {
     int rc = (int)ptrace_raw(PT_GETNUMLWPS, pid, NULL, 0);
     if (rc == -1) {
         if (errno != 16) {
-            goto teardown_done;
+            goto free_and_detach;
         }
-        kill(pid, 17);
-        wait4(pid, NULL, 0, NULL);
+        if (kill(pid, 17) != 0
+            || debug_wait4_bounded(pid, NULL) != 1) {
+            goto free_and_detach;
+        }
         we_stopped = 1;
         rc    = (int)ptrace_raw(PT_GETNUMLWPS, pid, NULL, 0);
         count = rc;
         lwpids = (int *)net_alloc_buffer((unsigned long)(count * 4));
         if (!lwpids) {
-            resume_app_unelev(&es, pid);
-            ptrace_raw(PT_CONTINUE, pid, (void *)1, 0);
-            goto close_socket_and_unlock;
+            goto free_and_detach;
         }
         if (ptrace_raw(PT_GETLWPLIST, pid, lwpids, count) == -1) {
-            resume_app_unelev(&es, pid);
-            ptrace_raw(PT_CONTINUE, pid, (void *)1, 0);
-            goto close_socket_and_unlock;
+            goto free_and_detach;
         }
     } else {
         count = rc;
         lwpids = (int *)net_alloc_buffer((unsigned long)(count * 4));
         if (!lwpids) {
-            goto close_socket_and_unlock;
+            goto free_and_detach;
         }
         if (ptrace_raw(PT_GETLWPLIST, pid, lwpids, count) == -1) {
-            goto close_socket_and_unlock;
+            goto free_and_detach;
         }
     }
 
@@ -481,7 +503,10 @@ close_socket_and_unlock:
         close((int)dbgfd);
     }
 
-teardown_done:
+    g_debug_pending_wait_valid = 0;
+    g_debug_pending_wait_pid = 0;
+    g_debug_pending_wait_status = 0;
+    g_debug_phase = DEBUG_PHASE_DETACHED;
     if (es_active) elev_restore(&es);
 }
 
@@ -493,16 +518,48 @@ int debug_stopgo_handle(int pid, char action) {
 
     if (g_debug_attached) {
         if (action == 0) {
+            if (g_debug_phase == DEBUG_PHASE_RUNNING) {
+                scePthreadMutexUnlock(&g_server_mutex);
+                return 0;
+            }
+            if (g_debug_phase != DEBUG_PHASE_EVENT_STOPPED) {
+                scePthreadMutexUnlock(&g_server_mutex);
+                return -1;
+            }
+            g_debug_phase = DEBUG_PHASE_RESUMING;
             g_stopgo_resume_signal = 0;
             g_stopgo_resume_pid  = (uint32_t)pid;
             g_stopgo_last_signal = 0;
             g_stopgo_mode = 2;
         } else if (action == 1) {
+            if (g_debug_phase == DEBUG_PHASE_EVENT_STOPPED) {
+                scePthreadMutexUnlock(&g_server_mutex);
+                return 0;
+            }
+            if (g_debug_phase != DEBUG_PHASE_RUNNING) {
+                scePthreadMutexUnlock(&g_server_mutex);
+                return -1;
+            }
+            int stop_status = 0;
+            if (kill(pid, 0x11) != 0
+                || debug_wait4_bounded(pid, &stop_status) != 1) {
+                g_debug_phase = DEBUG_PHASE_BROKEN;
+                scePthreadMutexUnlock(&g_server_mutex);
+                return -1;
+            }
+            if (((stop_status >> 8) & 0xFF) != 0x11) {
+                g_debug_pending_wait_pid = (uint32_t)pid;
+                g_debug_pending_wait_status = stop_status;
+                g_debug_pending_wait_valid = 1;
+                g_debug_phase = DEBUG_PHASE_EVENT_PENDING;
+                scePthreadMutexUnlock(&g_server_mutex);
+                return 0;
+            }
             g_stopgo_last_signal = 0x11;
-            kill(pid, 0x11);
-            wait4(pid, NULL, 0, NULL);
+            g_debug_phase = DEBUG_PHASE_EVENT_STOPPED;
             g_stopgo_mode = 2;
         } else if (action == 2) {
+            g_debug_phase = DEBUG_PHASE_DETACHING;
             g_stopgo_resume_signal = 9;
             g_stopgo_resume_pid  = (uint32_t)pid;
             g_stopgo_last_signal = 9;
@@ -513,14 +570,18 @@ int debug_stopgo_handle(int pid, char action) {
             uint32_t sig = k_stopgo_signal_table[(unsigned char)action];
             g_stopgo_mode = 1;
             g_stopgo_last_signal = sig;
-            kill(pid, (int)sig);
-            wait4(pid, NULL, 0, NULL);
+            if (kill(pid, (int)sig) != 0 || debug_wait4_bounded(pid, NULL) != 1) {
+                scePthreadMutexUnlock(&g_server_mutex);
+                return -1;
+            }
             if (action == 0 && g_debug_attached) {
                 resume_app_via_self_id((int)g_stopgo_resume_pid);
             }
         } else {
-            kill(pid, 0);
-            wait4(pid, NULL, 0, NULL);
+            if (kill(pid, 0) != 0 || debug_wait4_bounded(pid, NULL) != 1) {
+                scePthreadMutexUnlock(&g_server_mutex);
+                return -1;
+            }
         }
     }
 
@@ -538,16 +599,18 @@ int debug_process_stop_handle(int fd, struct cmd_packet *packet) {
     int pid = *(int *)data;
     if (pid == 0)   { net_send_int32(fd, CMD_ERROR); return 1; }
 
-    debug_stopgo_handle(pid, (char)action);
+    if (debug_stopgo_handle(pid, (char)action) != 0) {
+        net_send_int32(fd, CMD_ERROR);
+        return 0;
+    }
     net_send_int32(fd, CMD_SUCCESS);
     return 0;
 }
 
 extern long ptrace_raw(int op, int pid, void *addr, int data);
-extern int *__error(void);
 
 int debug_attach_handle(int fd, struct cmd_packet *packet) {
-    if (g_debug_attached) {
+    if (g_debug_attached || g_debug_phase != DEBUG_PHASE_DETACHED) {
         net_send_int32(fd, CMD_ALREADY_DEBUG);
         return 1;
     }
@@ -555,39 +618,58 @@ int debug_attach_handle(int fd, struct cmd_packet *packet) {
     struct cmd_debug_attach_packet *ap =
         (struct cmd_debug_attach_packet *)packet->data;
     if (!ap) {
+        curdbgcli = NULL;
+        curdbgctx = NULL;
         net_send_int32(fd, CMD_DATA_NULL);
         return 1;
     }
 
+    g_debug_phase = DEBUG_PHASE_ATTACHING;
+    DBGCTX()->pid = ap->pid;
+    DBGCTX()->dbgfd = -1;
+
     struct elev_state es;
     if (elev_save_and_set(&es) != 0) {
+        g_debug_phase = DEBUG_PHASE_DETACHED;
+        curdbgcli = NULL;
+        curdbgctx = NULL;
         net_send_int32(fd, CMD_ERROR);
         return 1;
     }
 
     if (ptrace_raw(PT_ATTACH, ap->pid, NULL, 0) == -1) {
         elev_restore(&es);
+        g_debug_phase = DEBUG_PHASE_DETACHED;
+        curdbgcli = NULL;
+        curdbgctx = NULL;
         net_send_int32(fd, CMD_ERROR);
         return 1;
     }
 
     elev_restore(&es);
 
+    /* From this point on free_client must run the full remote teardown on any
+       error. Claim the lifecycle only after PT_ATTACH has actually succeeded. */
+    g_debug_attached = 1;
+    *(uint32_t *)((char *)curdbgcli + 8) = 1;
+
     int wait_status = 0;
-    *__error() = 0;
-    long wait_rc = ps5debug_syscall(7 , (long)ap->pid, (long)&wait_status, 0L, 0L, 0L, 0L);
-    if (wait_rc == -1) {
-        sceKernelUsleep(20000);
+    if (debug_wait4_bounded(ap->pid, &wait_status) != 1) {
+        g_debug_phase = DEBUG_PHASE_BROKEN;
+        net_send_int32(fd, CMD_ERROR);
+        return 1;
     }
 
     resume_app_via_self_id(ap->pid);
 
     if (elev_save_and_set(&es) != 0) {
+        g_debug_phase = DEBUG_PHASE_BROKEN;
         net_send_int32(fd, CMD_ERROR);
         return 1;
     }
     if (ptrace_raw(PT_CONTINUE, ap->pid, (void *)1, 0) != 0) {
         elev_restore(&es);
+        g_debug_phase = DEBUG_PHASE_BROKEN;
         net_send_int32(fd, CMD_ERROR);
         return 1;
     }
@@ -596,12 +678,12 @@ int debug_attach_handle(int fd, struct cmd_packet *packet) {
 
     void *evt_client_sockaddr = (char *)curdbgcli + 0x0C;
     if (connect_debugger(DBGCTX(), evt_client_sockaddr) != 0) {
+        g_debug_phase = DEBUG_PHASE_BROKEN;
         net_send_int32(fd, CMD_ERROR);
         return 1;
     }
 
-    DBGCTX()->pid = ap->pid;
-    *(uint32_t *)((char *)curdbgcli + 8) = 1;
+    g_debug_phase = DEBUG_PHASE_RUNNING;
     net_send_int32(fd, CMD_SUCCESS);
     return 0;
 }
@@ -704,7 +786,11 @@ int debug_set_watchpoint_handle(int fd, struct cmd_packet *packet) {
         }
     } else {
         if (errno != 16 ) goto wp_err_no_resume;
-        kill(pid, 17); wait4(pid, NULL, 0, NULL);
+        if (kill(pid, 17) != 0
+            || debug_wait4_bounded(pid, NULL) != 1) {
+            g_debug_phase = DEBUG_PHASE_BROKEN;
+            goto wp_err_no_resume;
+        }
         count = (int)ptrace_raw(PT_GETNUMLWPS, pid, NULL, 0);
         we_stopped = 1;
         lwpids = (int *)net_alloc_buffer((unsigned long)(count * 4));
@@ -777,8 +863,12 @@ int debug_get_thread_list_handle(int fd, struct cmd_packet *packet) {
 
     if (count == -1) {
         if (errno != 16 ) { net_send_int32(fd, CMD_ERROR); return 1; }
-        kill(pid, 17 );
-        wait4(pid, NULL, 0, NULL);
+        if (kill(pid, 17) != 0
+            || debug_wait4_bounded(pid, NULL) != 1) {
+            g_debug_phase = DEBUG_PHASE_BROKEN;
+            net_send_int32(fd, CMD_ERROR);
+            return 1;
+        }
         count = (int)ptrace_elev(PT_GETNUMLWPS, pid, NULL, 0);
         we_stopped = 1;
     }
@@ -935,8 +1025,11 @@ int debug_getdbregs_handle(int fd, struct cmd_packet *packet) {
 
     int we_stopped = 0;
     if (is_process_stopped(pid) == 0) {
-        kill(pid, 17 );
-        wait4(pid, NULL, 0, NULL);
+        if (kill(pid, 17) != 0
+            || debug_wait4_bounded(pid, NULL) != 1) {
+            g_debug_phase = DEBUG_PHASE_BROKEN;
+            goto err;
+        }
         we_stopped = 1;
     }
 
@@ -973,9 +1066,12 @@ int debug_setdbregs_handle(int fd, struct cmd_packet *packet) {
     net_send_int32(fd, CMD_SUCCESS);
     net_recv_all(fd, buf, sp->length, 1);
 
-    ptrace_elev(PT_CONTINUE, pid, (void *)1, 0);
-    kill(pid, 17 );
-    wait4(pid, NULL, 0, NULL);
+    if (ptrace_elev(PT_CONTINUE, pid, (void *)1, 0) != 0
+        || kill(pid, 17) != 0
+        || debug_wait4_bounded(pid, NULL) != 1) {
+        g_debug_phase = DEBUG_PHASE_BROKEN;
+        goto err;
+    }
 
     if (ptrace_elev(PT_SETDBREGS, sp->lwpid, buf, 0) == -1 && errno != 0) goto err;
 
@@ -1040,7 +1136,10 @@ int debug_continue_handle(int fd, struct cmd_packet *packet) {
     void *data = packet->data;
     if (!data) { net_send_int32(fd, CMD_DATA_NULL); return 1; }
 
-    debug_stopgo_handle(pid, *(char *)data);
+    if (debug_stopgo_handle(pid, *(char *)data) != 0) {
+        net_send_int32(fd, CMD_ERROR);
+        return 0;
+    }
     net_send_int32(fd, CMD_SUCCESS);
     return 0;
 }
@@ -1118,6 +1217,7 @@ int debug_step_handle(int fd, struct cmd_packet *packet) {
         net_send_int32(fd, CMD_ERROR);
         return 1;
     }
+    g_debug_phase = DEBUG_PHASE_STEPPING;
     net_send_int32(fd, CMD_SUCCESS);
     return 0;
 }
@@ -1147,6 +1247,7 @@ int debug_step_thread_handle(int fd, struct cmd_packet *packet) {
     }
 
     if (rc != 0) { net_send_int32(fd, CMD_ERROR); return 1; }
+    g_debug_phase = DEBUG_PHASE_STEPPING;
     net_send_int32(fd, CMD_SUCCESS);
     return 0;
 }
@@ -1168,11 +1269,18 @@ static void debug_handle_breakpoint_resume(void) {
         sig = (int)g_stopgo_resume_signal;
     }
 
-    ptrace_raw(PT_CONTINUE, pid, (void *)1, sig);
+    errno = 0;
+    long continue_rc = ptrace_raw(PT_CONTINUE, pid, (void *)1, sig);
+    int continue_errno = errno;
 
     if ((int)g_stopgo_resume_signal == 17) {
-        wait4(pid, NULL, 0, NULL);
+        if (debug_wait4_bounded(pid, NULL) != 1) continue_rc = -1;
     }
+
+    g_debug_phase = (continue_rc == 0
+        || (sig == 0 && continue_rc == -1 && continue_errno == 16))
+        ? DEBUG_PHASE_RUNNING
+        : DEBUG_PHASE_BROKEN;
 
     g_stopgo_resume_signal = 0xFFFFFFFFu;
     g_stopgo_resume_pid  = 0;
@@ -1190,27 +1298,50 @@ int dispatch_debug_events(void) {
     gettimeofday((struct timeval *)&now, NULL);
     if (((uint32_t)now.tv_sec - g_last_alive_check) > 4) {
         if (!kern_thread_step_walker((int)DBGCTX()->pid)) {
+            g_debug_phase = DEBUG_PHASE_BROKEN;
             DDE_RETURN(1);
         }
         g_last_alive_check = (uint32_t)now.tv_sec;
     }
 
+    int debug_pid = (int)DBGCTX()->pid;
     int status = 0;
-    int wait_rc = wait4((int)DBGCTX()->pid, &status, 1 , NULL);
+    int wait_rc;
+    if (g_debug_pending_wait_valid
+        && g_debug_pending_wait_pid == (uint32_t)debug_pid) {
+        status = g_debug_pending_wait_status;
+        g_debug_pending_wait_valid = 0;
+        g_debug_pending_wait_pid = 0;
+        g_debug_pending_wait_status = 0;
+        wait_rc = debug_pid;
+    } else {
+        wait_rc = wait4(debug_pid, &status, 1 , NULL);
+    }
     if (wait_rc == 0) DDE_RETURN(0);
+    if (wait_rc < 0) {
+        g_debug_phase = DEBUG_PHASE_BROKEN;
+        DDE_RETURN(1);
+    }
+
+    g_debug_phase = DEBUG_PHASE_PROCESSING_EVENT;
 
     uint8_t sig = (uint8_t)((status >> 8) & 0xFF);
-    if (sig == 17) DDE_RETURN(0);
+    if (sig == 17) {
+        g_debug_phase = DEBUG_PHASE_EVENT_STOPPED;
+        DDE_RETURN(0);
+    }
 
     if (sig == 9) {
+        int dead_pid = debug_pid;
         debug_full_teardown(curdbgctx);
-        ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 9);
+        ptrace_raw(PT_CONTINUE, dead_pid, (void *)1, 9);
         DDE_RETURN(0);
     }
 
     uint8_t lwpi[160];
     if (ptrace_raw(PT_LWPINFO, (int)DBGCTX()->pid, lwpi, 160) != 0) {
         resume_app_via_self_id((int)DBGCTX()->pid);
+        g_debug_phase = DEBUG_PHASE_BROKEN;
         DDE_RETURN(1);
     }
 
@@ -1223,7 +1354,8 @@ int dispatch_debug_events(void) {
             for (int _i = 0; _i < 30; _i++) {
                 uint64_t _a = *(uint64_t *)(_abs_base + _i * 0x18);
                 if (_a != 0 && _a == _abs_rm1) {
-                    ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 0);
+                    long rc = ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 0);
+                    g_debug_phase = (rc == 0) ? DEBUG_PHASE_RUNNING : DEBUG_PHASE_BROKEN;
                     DDE_RETURN(0);
                 }
             }
@@ -1238,7 +1370,8 @@ int dispatch_debug_events(void) {
             for (int _i = 0; _i < 30; _i++) {
                 uint64_t _a = *(uint64_t *)(_pabs_base + _i * 0x18);
                 if (_a != 0 && _a == _pabs_rip) {
-                    ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 0);
+                    long rc = ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 0);
+                    g_debug_phase = (rc == 0) ? DEBUG_PHASE_RUNNING : DEBUG_PHASE_BROKEN;
                     DDE_RETURN(0);
                 }
             }
@@ -1268,11 +1401,15 @@ int dispatch_debug_events(void) {
         } else {
             if (kern_get_proc_info_by_pid(pid, lwpid, regs_buf) != 0
                 && ptrace_raw(PT_GETREGS, lwpid, regs_buf, 0) != 0) {
-                resume_app_via_self_id(pid); DDE_RETURN(1);
+                resume_app_via_self_id(pid);
+                g_debug_phase = DEBUG_PHASE_BROKEN;
+                DDE_RETURN(1);
             }
             if (kern_proc_install_dbregs(pid, lwpid, fpu_buf) != 0
                 && ptrace_raw(PT_GETFPREGS, lwpid, fpu_buf, 0) != 0) {
-                resume_app_via_self_id(pid); DDE_RETURN(1);
+                resume_app_via_self_id(pid);
+                g_debug_phase = DEBUG_PHASE_BROKEN;
+                DDE_RETURN(1);
             }
             if (kern_get_dbregs(pid, lwpid, dbreg_buf) == 0) {
                 got_dbreg = true;
@@ -1280,17 +1417,23 @@ int dispatch_debug_events(void) {
         }
     } else {
         if (ptrace_raw(PT_GETREGS, lwpid, regs_buf, 0) != 0) {
-            resume_app_via_self_id(pid); DDE_RETURN(1);
+            resume_app_via_self_id(pid);
+            g_debug_phase = DEBUG_PHASE_BROKEN;
+            DDE_RETURN(1);
         }
         memset(fpu_buf, 0, 832);
         if (ptrace_raw(PT_GETFPREGS, lwpid, fpu_buf, 0) != 0) {
-            resume_app_via_self_id(pid); DDE_RETURN(1);
+            resume_app_via_self_id(pid);
+            g_debug_phase = DEBUG_PHASE_BROKEN;
+            DDE_RETURN(1);
         }
     }
 
     if (!got_dbreg) {
         if (ptrace_raw(PT_GETDBREGS, lwpid, dbreg_buf, 0) != 0) {
-            resume_app_via_self_id(pid); DDE_RETURN(1);
+            resume_app_via_self_id(pid);
+            g_debug_phase = DEBUG_PHASE_BROKEN;
+            DDE_RETURN(1);
         }
     }
 
@@ -1319,7 +1462,8 @@ int dispatch_debug_events(void) {
     if (matched_bp_v34 != NULL &&
         *(int32_t *)(lwpi + 0x38) == 2 ) {
 
-        ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 0);
+        long rc = ptrace_raw(PT_CONTINUE, (int)DBGCTX()->pid, (void *)1, 0);
+        g_debug_phase = (rc == 0) ? DEBUG_PHASE_RUNNING : DEBUG_PHASE_BROKEN;
         DDE_RETURN(0);
     }
 
@@ -1550,7 +1694,8 @@ int dispatch_debug_events(void) {
     int stepping = (int)g_stepping_lwpid;
     if (stepping > 0) {
         if ((int)pkt_lwpid != stepping) {
-            ptrace_raw(PT_CONTINUE, (int)pkt_lwpid, (void *)1, 0);
+            long rc = ptrace_raw(PT_CONTINUE, (int)pkt_lwpid, (void *)1, 0);
+            g_debug_phase = (rc == 0) ? DEBUG_PHASE_STEPPING : DEBUG_PHASE_BROKEN;
             DDE_RETURN(0);
         }
         *(uint64_t *)(pkt + 0x420 + 0x30) = 0;
@@ -1568,6 +1713,7 @@ int dispatch_debug_events(void) {
         if (_is_fatal && _match_last) {
             if (++g_storm_count > DBG_STORM_LIMIT) {
 
+                g_debug_phase = DEBUG_PHASE_EVENT_STOPPED;
                 DDE_RETURN(0);
             }
         } else {
@@ -1578,7 +1724,11 @@ int dispatch_debug_events(void) {
         g_storm_sig   = _final_sig;
     }
 
-    net_send_all(DBGCTX()->dbgfd, pkt, 1184);
+    g_debug_phase = DEBUG_PHASE_EVENT_STOPPED;
+    if (net_send_all(DBGCTX()->dbgfd, pkt, 1184) < 0) {
+        g_debug_phase = DEBUG_PHASE_BROKEN;
+        DDE_RETURN(1);
+    }
     resume_app_via_self_id((int)DBGCTX()->pid);
     DDE_RETURN(0);
 

@@ -43,6 +43,7 @@ extern void    *curdbgctx;
 extern uint32_t g_debug_attached;
 extern void    *g_server_mutex;
 extern void    *g_proc_rw_mutex;
+extern void    *g_debug_arbiter_mutex;
 
 #define SERVER_PORT       744
 #define SERVER_MAXCLIENTS 12
@@ -110,43 +111,52 @@ static int handle_client(struct server_client *svc) {
                 packet.data = data;
             }
 
-            if (g_debug_attached == 0 && packet.cmd == CMD_DEBUG_ATTACH) {
-                curdbgcli = svc;
-                curdbgctx = (void *)((char *)svc + 0x20);
-            }
-
             unsigned char client_idx = (unsigned char)((svc->active - 1) & 0xFFu);
 
             int _needs_dbg_lock = ((packet.cmd & 0xFFFF0000u) == 0xBDBB0000u);
             if (_needs_dbg_lock) {
+                scePthreadMutexLock(&g_debug_arbiter_mutex);
                 scePthreadMutexLock(&g_proc_rw_mutex);
                 scePthreadMutexLock(&g_server_mutex);
+            }
+            if (g_debug_attached == 0
+                && g_debug_phase == DEBUG_PHASE_DETACHED
+                && packet.cmd == CMD_DEBUG_ATTACH) {
+                curdbgcli = svc;
+                curdbgctx = (void *)((char *)svc + 0x20);
             }
             int rc = cmd_handler(fd, &packet, client_idx);
             if (_needs_dbg_lock) {
                 scePthreadMutexUnlock(&g_server_mutex);
                 scePthreadMutexUnlock(&g_proc_rw_mutex);
+                scePthreadMutexUnlock(&g_debug_arbiter_mutex);
             }
             if (data) free(data);
             if (rc != 0) return rc;
 
-            if (svc->debugging && g_stopgo_resume_signal != 0xFFFFFFFFu) {
+            if (svc->debugging
+                && (g_stopgo_resume_signal != 0xFFFFFFFFu
+                    || g_debug_pending_wait_valid)) {
+                scePthreadMutexLock(&g_debug_arbiter_mutex);
                 scePthreadMutexLock(&g_proc_rw_mutex);
                 scePthreadMutexLock(&g_server_mutex);
                 int dde_rc = dispatch_debug_events();
                 scePthreadMutexUnlock(&g_server_mutex);
                 scePthreadMutexUnlock(&g_proc_rw_mutex);
+                scePthreadMutexUnlock(&g_debug_arbiter_mutex);
                 if (dde_rc != 0) return 0;
             }
             continue;
         }
 
         if (svc->debugging) {
+            scePthreadMutexLock(&g_debug_arbiter_mutex);
             scePthreadMutexLock(&g_proc_rw_mutex);
             scePthreadMutexLock(&g_server_mutex);
             int dde_rc = dispatch_debug_events();
             scePthreadMutexUnlock(&g_server_mutex);
             scePthreadMutexUnlock(&g_proc_rw_mutex);
+            scePthreadMutexUnlock(&g_debug_arbiter_mutex);
             if (dde_rc != 0) return 0;
         }
         if (errno == ECONNRESET) return 0;

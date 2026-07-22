@@ -309,8 +309,8 @@ Literal spelling `INTALL` (typo preserved on the wire).
 - **Request body:** `struct cmd_proc_call_packet` (68 bytes):
   `uint32_t pid; uint64_t rpcstub, rpc_rip, rpc_rdi, rpc_rsi, rpc_rdx, rpc_rcx, rpc_r8, rpc_r9;`
 - **Response:** `CMD_SUCCESS`, then `struct cmd_proc_call_response`
-  `{ uint32_t pid; uint64_t rpc_rax; }` (12 bytes). On backend failure the
-  handler returns `-1` with no status word (the connection is then torn down).
+  `{ uint32_t pid; uint64_t rpc_rax; }` (12 bytes), or `CMD_ERROR` if the
+  remote call could not be run.
 
 #### `CMD_PROC_ELF = 0xBDAA0007` (`proc.c:691`)
 - **Request body:** `struct cmd_proc_elf_packet` `{ uint32_t pid; uint32_t length; }` (8 bytes).
@@ -342,11 +342,12 @@ Legacy single-pass scan. **No auth required.**
 
 #### `CMD_PROC_ALLOC = 0xBDAA000B` (`proc.c:853`)
 - **Request body:** `struct cmd_proc_alloc_packet` (8 bytes, `{ pid, length }`).
-- **Response:** `CMD_SUCCESS`, `struct cmd_proc_alloc_response` `{ uint64_t address; }` (8 bytes).
+- **Response:** `CMD_SUCCESS`, `struct cmd_proc_alloc_response` `{ uint64_t address; }` (8 bytes),
+  or `CMD_ERROR` on failure.
 
 #### `CMD_PROC_FREE = 0xBDAA000C` (`proc.c:880`)
 - **Request body:** `struct cmd_proc_free_packet` (16 bytes, `{ pid, address, length }`).
-- **Response:** `CMD_SUCCESS`.
+- **Response:** `CMD_SUCCESS`, or `CMD_ERROR` if the allocation could not be released.
 
 > **Alloc arena (default ON).** A plain `CMD_PROC_ALLOC` is served from a server-side
 > per-pid 16 MB arena: one hijacking `mmap` per segment, then zero-hijack sub-allocation
@@ -358,6 +359,11 @@ Legacy single-pass scan. **No auth required.**
 > be toggled at runtime via the raw literal `0xBDAACC24` (`proc_arena_handle`): request body
 > `uint32_t` (`1` = enable, `0` = disable), response `CMD_SUCCESS` + `uint32_t len` + a text
 > status line.
+>
+> **Debugger ownership gate.** Allocation, free, and call operations that require a remote
+> ptrace RPC are rejected with `CMD_ERROR` while the same target is stopped at a debugger
+> event (or is in another non-running debugger transition). The server does not continue or
+> consume the client-owned event. Clients should continue or detach the debugger and retry.
 
 #### `0xBDAA000D` - first-map probe (`proc.c:901`, `proc_unknown_d_handle`)
 Raw literal, no `CMD_*` macro.
