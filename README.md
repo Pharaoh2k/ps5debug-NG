@@ -141,10 +141,11 @@ iterative scan, so clients reuse one parser.
   live in a per-connection server buffer instead of being re-uploaded each pass;
   rescans refresh each survivor's baseline so "since last scan" deltas work without
   the client holding state. `CMD_PROC_TURBOSCAN_GET` fetches values on demand.
-- **Unknown-initial-value scans** (`TSE_SNAPSHOT`) - a membership bitmap + value
-  snapshot (RAM, or an NVMe `/data` file for large regions) drives
+- **Unknown-initial-value scans** (`TSE_SNAPSHOT`) - a server-side value snapshot
+  (RAM, or an NVMe `/data` file for large regions) drives
   increased/decreased/changed narrowing with no known starting value, materialising
-  to a compact record list once survivors get sparse. By default the seed **drops
+  to a compact record list once survivors get sparse. Dense snapshots use a bitmap;
+  Simple float snapshots use survivor records from the start. By default the seed **drops
   all-zero slots** (most memory is zeroed and rarely useful); `TS_SNAPSHOT_INCLUDE_ZEROS`
   keeps them.
 - **Multi-segment scans** (`TSE_SNAPSHOT_SEGMENTS`) - a single session can cover a
@@ -180,6 +181,18 @@ iterative scan, so clients reuse one parser.
   scattered windows and any alias miss stay on mdbg. The survivor set is
   per-connection, so it is single-connection by nature; a multi-connection client
   must not enable it across many connections at once. Same wire result either way.
+- **Float policy offload** (`TSE_FLOAT_POLICY`, `TSE_COMPACT_SIMPLE_SNAPSHOT`) - clients may send
+  `TS_FLOAT_SIMPLE` plus the configured exponent-distance threshold so the server
+  excludes extreme/denormal float and double candidates from survivor membership,
+  later narrowing, and streaming/GET transfer. `TS_FLOAT_EXACT` makes exact-value
+  float/double scans use numeric IEEE equality instead of the legacy fuzzy
+  comparison. The policy is enforced consistently during streaming START,
+  snapshot creation, and every resident or client-driven COUNT rescan. When Simple
+  seeds a snapshot, filtering now happens before storage: only survivor records are
+  written, no raw-slot bitmap is allocated, optional First/Previous values are embedded
+  per record, and each later narrow compacts the stream again. The dedicated compact
+  capability bit lets clients distinguish this storage guarantee from older payloads
+  that advertised float-policy correctness but still used dense snapshot backing.
 - **Region classify** (`0xBDAACC16`) - returns every readable region with its cache
   attribute (uncached `PCD` leaf-PTE bit) and a measured read throughput, so the client
   can offer the user a per-region "exclude uncached/slow" choice (e.g. the GPU/Garlic

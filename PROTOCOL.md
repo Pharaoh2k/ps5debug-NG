@@ -555,6 +555,8 @@ and request flags are in `protocol.h:22-37`.
 | `0x80` | `TSE_SNAPSHOT_PREVIOUS` | `TS_SNAPSHOT_KEEP_PREVIOUS`: CC13 GET `previous` carries the prior-scan value (not the last-scan value) |
 | `0x100` | `TSE_PARALLEL_COMPARE` | `TS_PARALLEL_COMPARE` supported (server-side multi-thread for the aliased SIMD exact-match streaming scan) |
 | `0x200` | `TSE_RESCAN_ALIASING`  | `TS_RESCAN_ALIASING` supported (CC12 rescan reads full-size survivor windows via the aliasing engine) |
+| `0x400` | `TSE_FLOAT_POLICY`     | server applies the negotiated Simple/exact float policy during START, snapshot seed, and all COUNT paths |
+| `0x800` | `TSE_COMPACT_SIMPLE_SNAPSHOT` | a float/double snapshot seeded with `TS_FLOAT_SIMPLE` filters before storage and keeps survivor records only |
 
 **Per-request flags** (`START` / `COUNT` `flags` field):
 
@@ -569,6 +571,23 @@ and request flags are in `protocol.h:22-37`.
 | `0x40` | `TS_SNAPSHOT_KEEP_PREVIOUS` | retain a prior-scan value store so CC13 GET `previous` = value at the previous scan, not the just-matched one (`START` + `TS_SNAPSHOT` only) |
 | `0x80` | `TS_PARALLEL_COMPARE` | split the scan across worker threads server-side - `START` + `TS_USE_ALIASING`, exact-match (compareType 0) streaming only. For **single-connection** clients; a multi-connection client should parallelize by opening more connections instead (the server threads per connection), and must **not** also set this (the two compose to over-subscription, which is slower). Ignored on any non-qualifying scan. |
 | `0x100` | `TS_RESCAN_ALIASING` | `COUNT` rescans read full-size (gap-bridged, contiguous) survivor windows via the aliasing read engine instead of mdbg; tiny scattered windows and any alias failure fall back to mdbg (the floor). ~2-3x faster on dense/moderate-density rescans (the win grows as survivors stay dense; past ~32KB inter-survivor gaps windows fragment and it stays mdbg). Applies to all three CC12 rescan paths (snapshot-resident, list-resident, client-driven). The survivor set is **per-connection**, so this is single-connection by nature - a multi-connection client must **not** enable it on many connections at once (over-subscribes the aliasing setup, same caveat as `TS_PARALLEL_COMPARE`). |
+| `0x200` | `TS_FLOAT_SIMPLE` | float/double only: retain positive zero or values whose IEEE exponent is within the packed threshold of 1.0's exponent; applies to every compare type and snapshot seeding |
+| `0x400` | `TS_FLOAT_EXACT` | exact-value float/double only: use numeric IEEE equality (`+0 == -0`, NaN unequal) instead of the legacy fuzzy comparator |
+
+When `TS_FLOAT_SIMPLE` is set, bits 16-22 carry a 7-bit exponent-distance
+threshold (`TS_FLOAT_EXPONENT_MASK = 0x007F0000`, shift 16). Values 1-127 are
+literal; zero defensively means the default 11. Clients must only send these
+policy fields when CAPS advertises `TSE_FLOAT_POLICY`. Servers ignore the
+unused high field when Simple is clear.
+
+When CAPS also advertises `TSE_COMPACT_SIMPLE_SNAPSHOT`, snapshot creation with
+`TS_FLOAT_SIMPLE` filters each float/double before it is stored. The session keeps
+one address-sorted record per survivor (`address`, current, and optional Previous/
+First values), allocates no raw-slot bitmap, and compacts that record stream again
+after every narrow. Initial RAM/file size and write I/O therefore scale with the
+survivor count, not the raw slot count. Clients must not infer this storage contract
+from `TSE_FLOAT_POLICY` alone: an older policy-capable server may still use dense
+snapshot backing.
 
 ##### `CMD_PROC_TURBOSCAN_CAPS = 0xBDAACC10` (`proc_turboscan_caps_handle`)
 Capability probe. **No auth required.**
@@ -806,16 +825,21 @@ place, since-last-scan) - which streams its own throttled `u64 slots_scanned` pr
 records (relative to `slot_count`), terminated by the same sentinel, before the survivor
 count (see CC12 above; the reply shape is mode-independent, so once the survivors get
 sparse and the session materialises into a list, later narrows still parse identically) -
-and `CC13 GET` fetches survivors. The value snapshot is **RAM-backed when it fits under
-the RAM threshold** (default 512 MiB, tunable via `CC15`); a larger store is **hybrid** -
-the first threshold bytes (whole slots) stay in anon RAM and only the overflow goes to a
+and `CC13 GET` fetches survivors. With `TS_FLOAT_SIMPLE` plus
+`TSE_COMPACT_SIMPLE_SNAPSHOT`, the value snapshot is a survivor-record stream with
+no bitmap; optional First/Previous values live in each record, and rejected raw
+slots are never written. With Simple off, the legacy raw-slot-dense value stores and
+RAM bitmap are unchanged. Either store is **RAM-backed when it fits under the RAM
+threshold** (default 512 MiB, tunable via `CC15`); a larger store is **hybrid** - the
+first threshold bytes (whole slots or records) stay in anon RAM and only the overflow goes to a
 `ps5dbg_snap_NN.bin` file under the spill directory (default `/data`, also `CC15`-tunable
 to e.g. `/mnt/ext1` or `/mnt/usb0`). The spill is accessed by windowed `pread`/`pwrite`
 **written in 16 MiB chunks** (amortizes the per-`write()` FS overhead - HW-measured ~1.5x
 over 1 MiB); file-backed `mmap` is avoided because faulting a `MAP_SHARED` page sleeps
 under a held VM lock and panics the console. The store is read/written sequentially, so
 at most one create-chunk / narrow-window straddles the RAM/file boundary (split
-transparently), and the membership bitmap is always RAM. The file is unlinked on `END` / disconnect / new scan,
+transparently). Dense sessions keep their membership bitmap in RAM; compact Simple
+sessions have no bitmap. The file is unlinked on `END` / disconnect / new scan,
 and `/data` is swept at startup (spill files left on a removable/expansion mount are not
 swept, but are bounded to one per client slot and truncated on reuse).
 

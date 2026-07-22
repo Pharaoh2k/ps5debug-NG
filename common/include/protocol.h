@@ -35,6 +35,8 @@
 #define TSE_SNAPSHOT_PREVIOUS 0x00000080u     /* TS_SNAPSHOT_KEEP_PREVIOUS: CC13 GET "previous" = prior-scan value (not last-scan) */
 #define TSE_PARALLEL_COMPARE  0x00000100u     /* TS_PARALLEL_COMPARE supported (server-side multi-thread for the aliased SIMD exact-match streaming scan) */
 #define TSE_RESCAN_ALIASING   0x00000200u     /* TS_RESCAN_ALIASING supported (CC12 rescan reads full-size survivor windows via the aliasing engine) */
+#define TSE_FLOAT_POLICY      0x00000400u     /* TS_FLOAT_SIMPLE / TS_FLOAT_EXACT + packed exponent threshold supported */
+#define TSE_COMPACT_SIMPLE_SNAPSHOT 0x00000800u /* TS_FLOAT_SIMPLE snapshots store survivor records instead of raw-slot-dense backing */
 
 /* TURBOSCAN START/COUNT flags (per-request; opt-in). Phase 1 honored none. */
 #define TS_USE_ALIASING    0x00000001u        /* Phase 3 read engine (client opt-in) */
@@ -46,6 +48,10 @@
 #define TS_SNAPSHOT_KEEP_PREVIOUS 0x00000040u /* START+TS_SNAPSHOT: retain a prior-scan value store so CC13 GET "previous" = value at the previous scan (not the just-matched value) */
 #define TS_PARALLEL_COMPARE 0x00000080u       /* START+TS_USE_ALIASING, exact-match streaming: split the scan across worker threads server-side. For SINGLE-connection clients - multi-connection clients should fan out across connections instead (do NOT combine; over-subscribes) */
 #define TS_RESCAN_ALIASING  0x00000100u       /* CC12 (client opt-in): read full-size (bridging-dense) survivor windows via the aliasing engine instead of mdbg; tiny scattered windows + any alias failure fall back to mdbg (the floor). ~2-3x on dense/moderate rescans; single-connection clients (the survivor set is per-connection) - do NOT enable on many connections at once (over-subscribes the aliasing setup like TS_PARALLEL_COMPARE) */
+#define TS_FLOAT_SIMPLE     0x00000200u       /* float/double: retain only positive zero or values within the packed exponent distance of 1.0 */
+#define TS_FLOAT_EXACT      0x00000400u       /* exact-value float/double: numeric IEEE equality instead of the legacy fuzzy comparator */
+#define TS_FLOAT_EXPONENT_SHIFT 16u           /* TS_FLOAT_SIMPLE threshold: 7-bit unsigned exponent distance (1..127; 0 => 11) */
+#define TS_FLOAT_EXPONENT_MASK  0x007F0000u
 
 #define VALID_CMD(cmd)          (((cmd) >> 24) == 0xBDu)
 #define VALID_PROC_CMD(cmd)     ((((cmd) >> 16) & 0xFFu) == 0xAAu)
