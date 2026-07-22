@@ -258,6 +258,7 @@ extern int sys_proc_vm_map(uint32_t pid, void **out_maps, int *out_count);
 extern int gettimeofday(struct timeval *tp, void *tzp);
 
 #define INT3_REWIND_MAX 16
+#define DBG_BP_SLOT_SIZE 0x18
 static uint64_t g_recently_disabled_bps[INT3_REWIND_MAX];
 static int      g_recently_disabled_count = 0;
 
@@ -349,8 +350,19 @@ static void int3_iterative_sweep(int pid, const uint64_t *bp_addrs, int n_bps) {
     }
 }
 
+static void debug_clear_breakpoint_slots(void *svc) {
+    if (!svc) return;
+
+    for (int i = 0; i < MAX_BREAKPOINTS; i++) {
+        char *bp_entry = (char *)svc + i * DBG_BP_SLOT_SIZE;
+        *(uint32_t *)(bp_entry + 0x08) = 0;
+        *(uint64_t *)(bp_entry + 0x10) = 0;
+    }
+}
+
 void debug_full_teardown(void *svc) {
     if (!g_debug_attached) {
+        debug_clear_breakpoint_slots(svc);
         g_debug_pending_wait_valid = 0;
         g_debug_pending_wait_pid = 0;
         g_debug_pending_wait_status = 0;
@@ -399,18 +411,19 @@ void debug_full_teardown(void *svc) {
     }
     if (vm_maps) free(vm_maps);
 
-    char *rbx     = (char *)svc + 0x18;
-    char *bp_end  = (char *)svc + 0x2E8;
     uint64_t teardown_bp_addrs[INT3_REWIND_MAX];
     int teardown_n_bps = 0;
-    while (rbx != bp_end) {
-        uint64_t address = *(uint64_t *)(rbx - 8);
-        if (address == 0) break;
-        proc_write_mem((uint32_t)pid, address, 1, rbx);
-        if (teardown_n_bps < INT3_REWIND_MAX) {
-            teardown_bp_addrs[teardown_n_bps++] = address;
+    for (int i = 0; i < MAX_BREAKPOINTS; i++) {
+        char *bp_entry = (char *)svc + i * DBG_BP_SLOT_SIZE;
+        uint32_t enabled = *(uint32_t *)(bp_entry + 0x08);
+        uint64_t address = *(uint64_t *)(bp_entry + 0x10);
+        if (enabled && address) {
+            proc_write_mem((uint32_t)pid, address, 1,
+                           bp_entry + DBG_BP_SLOT_SIZE);
+            if (teardown_n_bps < INT3_REWIND_MAX) {
+                teardown_bp_addrs[teardown_n_bps++] = address;
+            }
         }
-        rbx += 0x18;
     }
 
     int3_iterative_sweep(pid, teardown_bp_addrs, teardown_n_bps);
@@ -502,6 +515,11 @@ close_socket_and_unlock:
     if (dbgfd > 0) {
         close((int)dbgfd);
     }
+
+    /* A command connection can attach again without being recreated. Clear
+       every slot after any live-target restores, including the dead-target
+       liveness-failure path, so a later arm cannot match stale state. */
+    debug_clear_breakpoint_slots(svc);
 
     g_debug_pending_wait_valid = 0;
     g_debug_pending_wait_pid = 0;
@@ -695,8 +713,6 @@ int debug_detach_handle(int fd, struct cmd_packet *packet) {
     return 0;
 }
 
-#define DBG_BP_SLOT_SIZE 0x18
-
 int debug_set_breakpoint_handle(int fd, struct cmd_packet *packet) {
     if (!g_debug_attached) { net_send_int32(fd, CMD_ERROR); return 1; }
     int pid = DBGCTX()->pid;
@@ -714,6 +730,39 @@ int debug_set_breakpoint_handle(int fd, struct cmd_packet *packet) {
     char *saved_byte_slot = bp_entry + DBG_BP_SLOT_SIZE;
 
     if (bp->enabled) {
+        if (bp->address == 0) {
+            net_send_int32(fd, CMD_ERROR);
+            return 0;
+        }
+
+        uint32_t was_enabled = *(uint32_t *)(bp_entry + 0x08);
+        uint64_t old_address = *(uint64_t *)(bp_entry + 0x10);
+
+        /* Repeating the exact same arm is idempotent. Re-reading here would
+           save the already-patched 0xCC and destroy the restore byte. Moving
+           an enabled slot must be expressed as a disarm followed by an arm. */
+        if (was_enabled) {
+            if (old_address == bp->address) {
+                net_send_int32(fd, CMD_SUCCESS);
+                return 0;
+            }
+            net_send_int32(fd, CMD_ERROR);
+            return 0;
+        }
+
+        /* Debug commands are serialized by handle_client's debugger locks.
+           Enforce one physical INT3 owner per address while those locks are
+           held so no second slot can save 0xCC as its original byte. */
+        for (int i = 0; i < MAX_BREAKPOINTS; i++) {
+            if (i == (int)bp->index) continue;
+            char *other = (char *)curdbgctx + i * DBG_BP_SLOT_SIZE;
+            if (*(uint32_t *)(other + 0x08)
+                && *(uint64_t *)(other + 0x10) == bp->address) {
+                net_send_int32(fd, CMD_ERROR);
+                return 0;
+            }
+        }
+
         *(uint32_t *)(bp_entry + 0x08) = 1;
         *(uint64_t *)(bp_entry + 0x10) = bp->address;
 
