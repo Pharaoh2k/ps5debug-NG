@@ -384,7 +384,7 @@ static int kern_init_dbgctx_at_addr_kern(uint32_t pid, uint64_t addr)
 
 static uint64_t proc_call_remote_sce(int pid)
 {
-    void *mmap_rv = freebsd_mmap((unsigned long)pid, (void *)0, 0x4000, 3,
+    void *mmap_rv = freebsd_mmap((unsigned long)pid, (void *)0, 0x4000, 7,
                                   0x1002, -1, 0);
     if ((long)mmap_rv == -1L) return 0;
     uint64_t scratch = (uint64_t)mmap_rv;
