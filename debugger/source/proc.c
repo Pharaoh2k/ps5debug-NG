@@ -7,6 +7,7 @@
 #include "kdbg.h"
 #include "kern_rw_fast.h"
 #include "proc_field_offsets.h"
+#include "write_policy.h"
 #include "Zydis.h"
 
 #define PROC_NEXT_OFFSET           0x00
@@ -420,22 +421,140 @@ int proc_list_handle(int fd, struct cmd_packet *packet) {
     return 0;
 }
 
-void proc_read_mem(uint32_t pid, uint64_t addr, uint64_t len, void *buf) {
+static int proc_read_mem_status(uint32_t pid, uint64_t addr,
+                                uint64_t len, void *buf) {
+    if ((int32_t)pid <= 0 || !buf || len == 0 || addr + len < addr)
+        return 1;
     if (proc_aux_range_contains(pid, addr, len) &&
         proc_ptwalk_read(pid, addr, len, buf) == 0)
-        return;
-    sys_proc_rw_w0((uint64_t)pid, addr, len, buf, 0);
+        return 0;
+    uint64_t read = 0;
+    long rc = sys_proc_rw_w0((uint64_t)pid, addr, len, buf,
+                             (uint64_t)(uintptr_t)&read);
+    return rc == 0 && read == len ? 0 : 1;
 }
 
-void proc_write_mem(uint32_t pid, uint64_t addr, uint64_t len, const void *buf) {
+void proc_read_mem(uint32_t pid, uint64_t addr, uint64_t len, void *buf) {
+    (void)proc_read_mem_status(pid, addr, len, buf);
+}
 
+static int proc_verify_mem_exact(uint32_t pid, uint64_t addr,
+                                 uint64_t len, const void *expected,
+                                 int diagnostic) {
+    uint8_t *actual = (uint8_t *)malloc((size_t)len);
+    if (!actual) return 1;
+
+    const uint8_t *wanted = (const uint8_t *)expected;
+    for (uint64_t i = 0; i < len; i++)
+        actual[i] = wanted[i] ^ 0xFFu;
+
+    int read_rc = proc_read_mem_status(pid, addr, len, actual);
+    int exact = read_rc == 0
+        && memcmp(actual, wanted, (size_t)len) == 0;
+    if (!exact) {
+        uint64_t mismatch = 0;
+        while (mismatch < len && actual[mismatch] == wanted[mismatch])
+            mismatch++;
+        klog_printf("[write:verify] pid=%u va=0x%llx len=%llu "
+                    "read-rc=%d exact=0 mismatch=+0x%llx\n",
+                    pid, (unsigned long long)addr,
+                    (unsigned long long)len, read_rc,
+                    (unsigned long long)mismatch);
+    } else if (diagnostic) {
+        klog_printf("[write:verify] pid=%u va=0x%llx len=%llu "
+                    "read-rc=0 exact=1\n",
+                    pid, (unsigned long long)addr,
+                    (unsigned long long)len);
+    }
+    free(actual);
+    return exact ? 0 : 1;
+}
+
+static uint8_t proc_write_mem_status(uint32_t pid, uint64_t addr,
+                                     uint64_t len, const void *buf) {
+    if ((int32_t)pid <= 0 || !buf || len == 0 || addr + len < addr)
+        return PROC_WRITE_STATUS_INVALID;
+
+    static uint32_t s_fw = 0;
     static int s_fw_needs_dmap = -1;
-    if (s_fw_needs_dmap < 0)
-        s_fw_needs_dmap = ((kernel_get_fw_version() & 0xffff0000u) >= 0x08400000u) ? 1 : 0;
+    if (s_fw_needs_dmap < 0) {
+        s_fw = kernel_get_fw_version();
+        s_fw_needs_dmap =
+            ((s_fw & 0xffff0000u) >= 0x08400000u) ? 1 : 0;
+    }
 
-    if (s_fw_needs_dmap && proc_ptwalk_write(pid, addr, len, buf) == 0)
-        return;
-    sys_proc_rw_w1((uint64_t)pid, addr, len, (void *)buf, 0);
+    int diagnostic = ps5debug_write_diagnostics_enabled();
+    int try_dmap =
+        PS5DEBUG_FORCE_WRITE_PATH == PS5DEBUG_WRITE_PATH_DMAP
+        || (PS5DEBUG_FORCE_WRITE_PATH == PS5DEBUG_WRITE_PATH_AUTO
+            && s_fw_needs_dmap);
+
+    if (diagnostic) {
+        const char *mode =
+            PS5DEBUG_FORCE_WRITE_PATH == PS5DEBUG_WRITE_PATH_DMAP ? "dmap"
+            : PS5DEBUG_FORCE_WRITE_PATH == PS5DEBUG_WRITE_PATH_MDBG ? "mdbg"
+            : "auto";
+        klog_printf("[write] pid=%u va=0x%llx len=%llu fw=0x%x mode=%s\n",
+                    pid, (unsigned long long)addr,
+                    (unsigned long long)len, s_fw, mode);
+    }
+
+    if (try_dmap) {
+        if (diagnostic) {
+            uint64_t phys = 0, page_size = 0, pte = 0;
+            int level = -1;
+            int probe_rc = proc_ptwalk_probe(pid, addr, &phys, &level,
+                                             &page_size, &pte);
+            klog_printf("[write] path=dmap probe=%d level=%d phys=0x%llx "
+                        "page=0x%llx pte=0x%llx\n",
+                        probe_rc, level, (unsigned long long)phys,
+                        (unsigned long long)page_size,
+                        (unsigned long long)pte);
+        }
+
+        int dmap_rc = proc_ptwalk_write(pid, addr, len, buf);
+        if (dmap_rc == PROC_PTW_WRITE_OK) {
+            if (diagnostic) klog_printf("[write] path=dmap result=OK\n");
+            return PROC_WRITE_STATUS_OK;
+        }
+
+        klog_printf("[write] pid=%u va=0x%llx len=%llu "
+                    "path=dmap result=FAIL rc=%d\n",
+                    pid, (unsigned long long)addr,
+                    (unsigned long long)len, dmap_rc);
+        if (dmap_rc == PROC_PTW_WRITE_VERIFY_FAILED)
+            return PROC_WRITE_STATUS_VERIFY_FAILED;
+        if (PS5DEBUG_FORCE_WRITE_PATH == PS5DEBUG_WRITE_PATH_DMAP)
+            return PROC_WRITE_STATUS_DMAP_FAILED;
+    }
+
+    uint64_t wrote = 0;
+    long mdbg_rc = sys_proc_rw_w1((uint64_t)pid, addr, len, (void *)buf,
+                                  (uint64_t)(uintptr_t)&wrote);
+    if (mdbg_rc != 0 || wrote != len) {
+        klog_printf("[write] pid=%u va=0x%llx len=%llu "
+                    "path=mdbg rc=%ld wrote=%llu result=FAIL\n",
+                    pid, (unsigned long long)addr,
+                    (unsigned long long)len, mdbg_rc,
+                    (unsigned long long)wrote);
+        return PROC_WRITE_STATUS_MDBG_FAILED;
+    }
+    int verify_rc = proc_verify_mem_exact(pid, addr, len, buf, diagnostic);
+    if (diagnostic) {
+        klog_printf("[write] pid=%u va=0x%llx len=%llu "
+                    "path=mdbg rc=%ld wrote=%llu verify=%s\n",
+                    pid, (unsigned long long)addr,
+                    (unsigned long long)len, mdbg_rc,
+                    (unsigned long long)wrote,
+                    verify_rc == 0 ? "OK" : "FAIL");
+    }
+    return verify_rc == 0
+           ? PROC_WRITE_STATUS_OK
+           : PROC_WRITE_STATUS_VERIFY_FAILED;
+}
+
+int proc_write_mem(uint32_t pid, uint64_t addr, uint64_t len, const void *buf) {
+    return proc_write_mem_status(pid, addr, len, buf);
 }
 
 int proc_read_handle(int fd, struct cmd_packet *packet) {
@@ -578,34 +697,35 @@ int proc_write_handle(int fd, struct cmd_packet *packet) {
 
     uint64_t length  = wp->length;
     uint64_t address = wp->address;
+    uint8_t  status  = PROC_WRITE_STATUS_OK;
 
     while (length > 0x10000) {
-        net_recv_all(fd, data, 0x10000, 1);
-        proc_write_mem(wp->pid, address, 0x10000, data);
+        if (net_recv_all(fd, data, 0x10000, 1) < 0) {
+            free(data);
+            return 1;
+        }
+        uint8_t chunk_status =
+            proc_write_mem_status(wp->pid, address, 0x10000, data);
+        if (status == PROC_WRITE_STATUS_OK)
+            status = chunk_status;
         address += 0x10000;
         length  -= 0x10000;
     }
     if (length > 0) {
-        net_recv_all(fd, data, (int)length, 1);
-        proc_write_mem(wp->pid, address, length, data);
+        if (net_recv_all(fd, data, (int)length, 1) < 0) {
+            free(data);
+            return 1;
+        }
+        uint8_t chunk_status =
+            proc_write_mem_status(wp->pid, address, length, data);
+        if (status == PROC_WRITE_STATUS_OK)
+            status = chunk_status;
     }
 
-    net_send_int32(fd, CMD_SUCCESS);
+    net_send_int32(fd, status == PROC_WRITE_STATUS_OK
+                       ? CMD_SUCCESS : CMD_ERROR);
     free(data);
     return 0;
-}
-
-static int proc_write_mem_status(uint32_t pid, uint64_t addr, uint64_t len, const void *buf) {
-    static int s_fw_needs_dmap = -1;
-    if (s_fw_needs_dmap < 0)
-        s_fw_needs_dmap = ((kernel_get_fw_version() & 0xffff0000u) >= 0x08400000u) ? 1 : 0;
-
-    if (s_fw_needs_dmap && proc_ptwalk_write(pid, addr, len, buf) == 0)
-        return 0;
-
-    uint64_t wrote = 0;
-    sys_proc_rw_w1((uint64_t)pid, addr, len, (void *)buf, (uint64_t)(uintptr_t)&wrote);
-    return (wrote == len) ? 0 : 1;
 }
 
 int proc_write_multi_handle(int fd, struct cmd_packet *packet) {
@@ -643,6 +763,7 @@ int proc_write_multi_handle(int fd, struct cmd_packet *packet) {
 
     net_send_int32(fd, CMD_SUCCESS);
 
+    int any_failed = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint8_t  hdr[12];
         if (net_recv_all(fd, hdr, 12, 1) < 0) {
@@ -666,7 +787,7 @@ int proc_write_multi_handle(int fd, struct cmd_packet *packet) {
 
         uint64_t length = len32;
         uint64_t a      = addr;
-        uint8_t  failed = 0;
+        uint8_t  failed = PROC_WRITE_STATUS_OK;
         while (length > 0) {
             uint64_t to_recv = (length > 0x10000ULL) ? 0x10000ULL : length;
             if (net_recv_all(fd, buf, (int)to_recv, 1) < 0) {
@@ -674,11 +795,14 @@ int proc_write_multi_handle(int fd, struct cmd_packet *packet) {
                 free(buf);
                 return 1;
             }
-            if (proc_write_mem_status(pid, a, to_recv, buf) != 0)
-                failed = 1;
+            uint8_t chunk_status =
+                proc_write_mem_status(pid, a, to_recv, buf);
+            if (failed == PROC_WRITE_STATUS_OK)
+                failed = chunk_status;
             a      += to_recv;
             length -= to_recv;
         }
+        if (failed != PROC_WRITE_STATUS_OK) any_failed = 1;
         if (status) status[i] = failed;
     }
 
@@ -686,7 +810,8 @@ int proc_write_multi_handle(int fd, struct cmd_packet *packet) {
         net_send_all(fd, status, (int)count);
         free(status);
     }
-    net_send_int32(fd, CMD_SUCCESS);
+    net_send_int32(fd, !want_status && any_failed
+                       ? CMD_ERROR : CMD_SUCCESS);
     free(buf);
     return 0;
 }

@@ -135,9 +135,14 @@ int proc_ptwalk_span_resolve(uint32_t pid, uint64_t span2m, int *out_huge,
                              uint64_t *out_phys_base, uint64_t *out_leaf_pt_kaddr,
                              uint64_t *out_pte);
 
+#define PROC_PTW_WRITE_OK              0
+#define PROC_PTW_WRITE_RESOLVE_FAILED  1
+#define PROC_PTW_WRITE_COPY_FAILED     2
+#define PROC_PTW_WRITE_VERIFY_FAILED   3
+
 int proc_ptwalk_write(uint32_t pid, uint64_t va, uint64_t len, const void *src);
 
 int proc_aux_range_contains(uint32_t pid, uint64_t addr, uint64_t len);
 
 void proc_read_mem(uint32_t pid, uint64_t addr, uint64_t len, void *buf);
-void proc_write_mem(uint32_t pid, uint64_t addr, uint64_t len, const void *buf);
+int proc_write_mem(uint32_t pid, uint64_t addr, uint64_t len, const void *buf);

@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "proc.h"
 #include "kern_rw_fast.h"
+#include "write_policy.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -362,26 +363,67 @@ int proc_ptwalk_augment(uint32_t pid,
     return rc;
 }
 
+static int ptw_verify_phys(uint32_t pid, uint64_t va, uint64_t phys,
+                           const uint8_t *expected, uint64_t len,
+                           int diagnostic) {
+    uint8_t actual[0x1000];
+    uint64_t done = 0;
+    while (done < len) {
+        uint64_t n = len - done;
+        if (n > sizeof(actual)) n = sizeof(actual);
+        if (kernel_copyout_fast((intptr_t)(g_ptw_dmap + phys + done),
+                                actual, (size_t)n) != 0) {
+            klog_printf("[write:dmap] pid=%u va=0x%llx len=%llu "
+                        "verify-read failed at +0x%llx\n",
+                        pid, (unsigned long long)va,
+                        (unsigned long long)len,
+                        (unsigned long long)done);
+            return PROC_PTW_WRITE_VERIFY_FAILED;
+        }
+        if (memcmp(actual, expected + done, (size_t)n) != 0) {
+            uint64_t mismatch = 0;
+            while (mismatch < n
+                   && actual[mismatch] == expected[done + mismatch])
+                mismatch++;
+            klog_printf("[write:dmap] pid=%u verify mismatch va=0x%llx "
+                        "expected=%02x actual=%02x\n",
+                        pid, (unsigned long long)(va + done + mismatch),
+                        expected[done + mismatch], actual[mismatch]);
+            return PROC_PTW_WRITE_VERIFY_FAILED;
+        }
+        done += n;
+    }
+    if (diagnostic) {
+        klog_printf("[write:dmap] pid=%u va=0x%llx len=%llu verify=OK\n",
+                    pid, (unsigned long long)va,
+                    (unsigned long long)len);
+    }
+    return PROC_PTW_WRITE_OK;
+}
+
 int proc_ptwalk_write(uint32_t pid, uint64_t va, uint64_t len, const void *src) {
-    if ((int32_t)pid <= 0 || !src || len == 0) return 1;
-    if (ptw_discover() != 1) return 1;
+    if ((int32_t)pid <= 0 || !src || len == 0 || va + len < va)
+        return PROC_PTW_WRITE_RESOLVE_FAILED;
+    if (ptw_discover() != 1) return PROC_PTW_WRITE_RESOLVE_FAILED;
 
     intptr_t kproc = kernel_get_proc_fast((pid_t)pid);
-    if (!kproc) return 1;
+    if (!kproc) return PROC_PTW_WRITE_RESOLVE_FAILED;
 
     uint64_t vmspace = 0;
     if (kernel_copyout_fast((intptr_t)(kproc + PTW_PROC_VMSPACE_OFF),
                             &vmspace, 8) != 0 || !vmspace)
-        return 1;
+        return PROC_PTW_WRITE_RESOLVE_FAILED;
 
     uint64_t pair[2];
     if (kernel_copyout_fast((intptr_t)(vmspace + g_ptw_pmap_off),
                             pair, sizeof(pair)) != 0)
-        return 1;
+        return PROC_PTW_WRITE_RESOLVE_FAILED;
 
     uint64_t cr3 = pair[1];
-    if (cr3 == 0 || (cr3 & 0xFFF) || cr3 >= PTW_PHYS_BOUND) return 1;
-    if (pair[0] - cr3 != g_ptw_dmap) return 1;
+    if (cr3 == 0 || (cr3 & 0xFFF) || cr3 >= PTW_PHYS_BOUND)
+        return PROC_PTW_WRITE_RESOLVE_FAILED;
+    if (pair[0] - cr3 != g_ptw_dmap)
+        return PROC_PTW_WRITE_RESOLVE_FAILED;
 
     const uint8_t *in   = (const uint8_t *)src;
     uint64_t       done = 0;
@@ -390,13 +432,13 @@ int proc_ptwalk_write(uint32_t pid, uint64_t va, uint64_t len, const void *src) 
         uint64_t e   = 0;
         int      lvl = -1;
         if (ptw_walk_leaf(g_ptw_dmap, cr3, cur_va, &e, &lvl) != 0)
-            return 1;
+            return PROC_PTW_WRITE_RESOLVE_FAILED;
 
         uint64_t page_size;
         if      (lvl == 3) page_size = 0x1000ULL;
         else if (lvl == 2) page_size = 0x200000ULL;
         else if (lvl == 1) page_size = 0x40000000ULL;
-        else return 1;
+        else return PROC_PTW_WRITE_RESOLVE_FAILED;
 
         uint64_t page_mask   = page_size - 1;
         uint64_t off_in_page = cur_va & page_mask;
@@ -406,13 +448,35 @@ int proc_ptwalk_write(uint32_t pid, uint64_t va, uint64_t len, const void *src) 
         uint64_t avail = page_size - off_in_page;
         if (n > avail) n = avail;
 
-        if (phys >= PTW_PHYS_BOUND || phys + n > PTW_PHYS_BOUND) return 1;
+        if (phys >= PTW_PHYS_BOUND || phys + n < phys
+            || phys + n > PTW_PHYS_BOUND)
+            return PROC_PTW_WRITE_RESOLVE_FAILED;
 
-        if (kernel_copyin_fast(in + done, (intptr_t)(g_ptw_dmap + phys), n) != 0)
-            return 1;
+        int diagnostic = ps5debug_write_diagnostics_enabled();
+        if (diagnostic) {
+            klog_printf("[write:dmap] pid=%u va=0x%llx len=%llu "
+                        "level=%d phys=0x%llx pte=0x%llx\n",
+                        pid, (unsigned long long)cur_va,
+                        (unsigned long long)n, lvl,
+                        (unsigned long long)phys,
+                        (unsigned long long)e);
+        }
+        if (kernel_copyin_fast(in + done,
+                               (intptr_t)(g_ptw_dmap + phys), n) != 0) {
+            klog_printf("[write:dmap] pid=%u va=0x%llx len=%llu "
+                        "copy failed level=%d phys=0x%llx pte=0x%llx\n",
+                        pid, (unsigned long long)cur_va,
+                        (unsigned long long)n, lvl,
+                        (unsigned long long)phys,
+                        (unsigned long long)e);
+            return PROC_PTW_WRITE_COPY_FAILED;
+        }
+        int verify_rc = ptw_verify_phys(pid, cur_va, phys, in + done,
+                                        n, diagnostic);
+        if (verify_rc != PROC_PTW_WRITE_OK) return verify_rc;
         done += n;
     }
-    return 0;
+    return PROC_PTW_WRITE_OK;
 }
 
 int proc_ptwalk_read(uint32_t pid, uint64_t va, uint64_t len, void *dst) {

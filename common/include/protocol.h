@@ -151,7 +151,9 @@ struct cmd_proc_write_packet {
 /* Bulk write / freeze batching (opcode 0xBDAACC04). Header body below is
    followed by `count` streamed entries, each { uint64 address; uint32 length;
    <length> bytes }. flags bit 0 asks the server for a per-entry status byte
-   array (0 = ok) sent just before the trailing CMD_SUCCESS. */
+   array sent just before the trailing CMD_SUCCESS; any nonzero byte is a
+   failure code below. Without that flag, any failed entry makes the trailing
+   status CMD_ERROR. */
 struct cmd_proc_write_multi_packet {
     uint32_t pid;
     uint32_t count;
@@ -160,6 +162,12 @@ struct cmd_proc_write_multi_packet {
 #define PROC_WRITE_MULTI_F_STATUS   0x1u
 #define PROC_WRITE_MULTI_MAX_COUNT  0xFFFFu
 #define PROC_WRITE_MULTI_MAX_ENTRY  0x100000u
+
+#define PROC_WRITE_STATUS_OK             0u
+#define PROC_WRITE_STATUS_INVALID        1u
+#define PROC_WRITE_STATUS_DMAP_FAILED    2u
+#define PROC_WRITE_STATUS_VERIFY_FAILED  3u
+#define PROC_WRITE_STATUS_MDBG_FAILED    4u
 
 struct cmd_proc_maps_packet {
     uint32_t pid;

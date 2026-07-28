@@ -9,6 +9,7 @@
 #include <ps5/kernel.h>
 #include "sdk_shim.h"
 #include "kern_rw_fast.h"
+#include "write_policy.h"
 
 static const uint64_t kr_write_setup_const[2] = { 0x0ULL,                  0x4000000000000000ULL };
 static const uint64_t kr_read_setup_const [2] = { 0x4000000040000000ULL,  0x4000000000000000ULL };
@@ -36,70 +37,183 @@ static __attribute__((noinline)) int kr_lazy_init(void) {
 
 typedef unsigned __int128 u128_alias __attribute__((may_alias));
 
+static int kr_setup_field(int fd, void *field, const char *direction,
+                          const char *step, intptr_t kaddr, size_t len,
+                          int diagnostic)
+{
+    errno = 0;
+    long rc = __crt_syscall(0x69, fd, 0x29, 0x2e, field, 0x14);
+    int saved_errno = errno;
+    if (diagnostic || rc != 0) {
+        klog_printf("[write:pipe] dir=%s kaddr=0x%llx len=%llu "
+                    "step=%s rc=%ld errno=%d\n",
+                    direction, (unsigned long long)kaddr,
+                    (unsigned long long)len, step, rc, saved_errno);
+    }
+    return rc == 0 ? 0 : -1;
+}
+
 __attribute__((target("no-avx")))
 static int32_t kernel_copyin_fast_inner(const void *udaddr, intptr_t kaddr, size_t len)
 {
     uint64_t f[7];
+    int diagnostic = ps5debug_write_diagnostics_enabled();
 
     *(u128_alias *)&f[0] = *(const u128_alias *)kr_write_setup_const;
     f[4] = kr_kpipe_addr;
     *(u128_alias *)&f[5] = 0;
 
-    if (__crt_syscall(0x69, kr_rwpair_0, 0x29, 0x2e, &f[4], 0x14) != 0) return -1;
+    if (kr_setup_field(kr_rwpair_0, &f[4], "in", "flags-address",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
     f[2] = 0;
-    if (__crt_syscall(0x69, kr_rwpair_1, 0x29, 0x2e, &f[0], 0x14) != 0) return -1;
+    if (kr_setup_field(kr_rwpair_1, &f[0], "in", "flags-value",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
 
     f[0] = (uint64_t)kaddr;
     *(u128_alias *)&f[1] = 0;
     f[4] = kr_kpipe_addr + 0x10;
     *(u128_alias *)&f[5] = 0;
 
-    if (__crt_syscall(0x69, kr_rwpair_0, 0x29, 0x2e, &f[4], 0x14) != 0) return -1;
-    if (__crt_syscall(0x69, kr_rwpair_1, 0x29, 0x2e, &f[0], 0x14) != 0) return -1;
+    if (kr_setup_field(kr_rwpair_0, &f[4], "in", "data-address",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
+    if (kr_setup_field(kr_rwpair_1, &f[0], "in", "data-value",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
 
-    __crt_syscall(4, kr_rwpipe_1, (uint64_t)udaddr, (uint64_t)len);
-    return 0;
-}
-
-int32_t kernel_copyin_fast(const void *udaddr, intptr_t kaddr, size_t len)
-{
-    if (!kr_initialized && kr_lazy_init() != 0) return -1;
-    scePthreadMutexLock(&kr_fast_mutex);
-    int32_t rc = kernel_copyin_fast_inner(udaddr, kaddr, len);
-    scePthreadMutexUnlock(&kr_fast_mutex);
-    return rc;
+    errno = 0;
+    long rc = __crt_syscall(SYS_write, kr_rwpipe_1,
+                            (uint64_t)udaddr, (uint64_t)len);
+    int saved_errno = errno;
+    if (diagnostic || rc != (long)len) {
+        klog_printf("[write:pipe] dir=in kaddr=0x%llx len=%llu "
+                    "step=transfer rc=%ld errno=%d\n",
+                    (unsigned long long)kaddr, (unsigned long long)len,
+                    rc, saved_errno);
+    }
+    return rc == (long)len ? 0 : -1;
 }
 
 __attribute__((target("no-avx")))
 static int32_t kernel_copyout_fast_inner(intptr_t kaddr, void *udaddr, size_t len)
 {
     uint64_t f[7];
+    int diagnostic = 0;
 
     *(u128_alias *)&f[0] = *(const u128_alias *)kr_read_setup_const;
     f[4] = kr_kpipe_addr;
     *(u128_alias *)&f[5] = 0;
 
-    if (__crt_syscall(0x69, kr_rwpair_0, 0x29, 0x2e, &f[4], 0x14) != 0) return -1;
+    if (kr_setup_field(kr_rwpair_0, &f[4], "out", "flags-address",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
     f[2] = 0;
-    if (__crt_syscall(0x69, kr_rwpair_1, 0x29, 0x2e, &f[0], 0x14) != 0) return -1;
+    if (kr_setup_field(kr_rwpair_1, &f[0], "out", "flags-value",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
 
     f[0] = (uint64_t)kaddr;
     *(u128_alias *)&f[1] = 0;
     f[4] = kr_kpipe_addr + 0x10;
     *(u128_alias *)&f[5] = 0;
 
-    if (__crt_syscall(0x69, kr_rwpair_0, 0x29, 0x2e, &f[4], 0x14) != 0) return -1;
-    if (__crt_syscall(0x69, kr_rwpair_1, 0x29, 0x2e, &f[0], 0x14) != 0) return -1;
+    if (kr_setup_field(kr_rwpair_0, &f[4], "out", "data-address",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
+    if (kr_setup_field(kr_rwpair_1, &f[0], "out", "data-value",
+                       kaddr, len, diagnostic) != 0)
+        return -1;
 
-    __crt_syscall(3, kr_rwpipe_0, udaddr, (uint64_t)len);
-    return 0;
+    errno = 0;
+    long rc = __crt_syscall(SYS_read, kr_rwpipe_0,
+                            udaddr, (uint64_t)len);
+    int saved_errno = errno;
+    if (diagnostic || rc != (long)len) {
+        klog_printf("[write:pipe] dir=out kaddr=0x%llx len=%llu "
+                    "step=transfer rc=%ld errno=%d\n",
+                    (unsigned long long)kaddr, (unsigned long long)len,
+                    rc, saved_errno);
+    }
+    return rc == (long)len ? 0 : -1;
+}
+
+static int32_t kernel_copyin_fast_locked(const void *udaddr,
+                                         intptr_t kaddr, size_t len)
+{
+    if (len == 0
+        || !ps5debug_write_needs_prefix((uint64_t)kaddr))
+        return kernel_copyin_fast_inner(udaddr, kaddr, len);
+    if (!udaddr || len == SIZE_MAX) return -1;
+
+    uint8_t *prefixed = (uint8_t *)malloc(len + 1);
+    if (!prefixed) return -1;
+    int32_t rc = kernel_copyout_fast_inner(kaddr - 1, prefixed, 1);
+    if (rc == 0) {
+        uint8_t leading = prefixed[0];
+        memcpy(prefixed + 1, udaddr, len);
+        if (ps5debug_write_diagnostics_enabled()) {
+            klog_printf("[write:pipe] dir=in kaddr=0x%llx len=%llu "
+                        "step=prefix-normalize shifted=0x%llx shifted-len=%llu\n",
+                        (unsigned long long)kaddr, (unsigned long long)len,
+                        (unsigned long long)(kaddr - 1),
+                        (unsigned long long)(len + 1));
+        }
+        rc = kernel_copyin_fast_inner(prefixed, kaddr - 1, len + 1);
+        uint8_t observed = leading ^ 0xFFu;
+        if (rc == 0
+            && (kernel_copyout_fast_inner(kaddr - 1, &observed, 1) != 0
+                || observed != leading)) {
+            klog_printf("[write:pipe] dir=in kaddr=0x%llx len=%llu "
+                        "prefix-preserve failed expected=%02x actual=%02x\n",
+                        (unsigned long long)kaddr, (unsigned long long)len,
+                        leading, observed);
+            rc = -1;
+        }
+    }
+    free(prefixed);
+    return rc;
+}
+
+static int32_t kernel_copyout_fast_locked(intptr_t kaddr,
+                                          void *udaddr, size_t len)
+{
+    if (len == 0
+        || !ps5debug_write_needs_prefix((uint64_t)kaddr))
+        return kernel_copyout_fast_inner(kaddr, udaddr, len);
+    if (!udaddr || len == SIZE_MAX) return -1;
+
+    uint8_t *prefixed = (uint8_t *)malloc(len + 1);
+    if (!prefixed) return -1;
+    if (ps5debug_write_diagnostics_enabled()) {
+        klog_printf("[write:pipe] dir=out kaddr=0x%llx len=%llu "
+                    "step=prefix-normalize shifted=0x%llx shifted-len=%llu\n",
+                    (unsigned long long)kaddr, (unsigned long long)len,
+                    (unsigned long long)(kaddr - 1),
+                    (unsigned long long)(len + 1));
+    }
+    int32_t rc =
+        kernel_copyout_fast_inner(kaddr - 1, prefixed, len + 1);
+    if (rc == 0) memcpy(udaddr, prefixed + 1, len);
+    free(prefixed);
+    return rc;
+}
+
+int32_t kernel_copyin_fast(const void *udaddr, intptr_t kaddr, size_t len)
+{
+    if (!kr_initialized && kr_lazy_init() != 0) return -1;
+    scePthreadMutexLock(&kr_fast_mutex);
+    int32_t rc = kernel_copyin_fast_locked(udaddr, kaddr, len);
+    scePthreadMutexUnlock(&kr_fast_mutex);
+    return rc;
 }
 
 int32_t kernel_copyout_fast(intptr_t kaddr, void *udaddr, size_t len)
 {
     if (!kr_initialized && kr_lazy_init() != 0) return -1;
     scePthreadMutexLock(&kr_fast_mutex);
-    int32_t rc = kernel_copyout_fast_inner(kaddr, udaddr, len);
+    int32_t rc = kernel_copyout_fast_locked(kaddr, udaddr, len);
     scePthreadMutexUnlock(&kr_fast_mutex);
     return rc;
 }
