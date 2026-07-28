@@ -46,6 +46,10 @@ the firmware as a decimal `uint16_t` (e.g. `900` for 9.00, `1240` for 12.40).
 ### Process inspection and manipulation
 - **Enumerate processes** (process name + pid list).
 - **Read and write target memory** in streamed chunks.
+- **Truthful writes** - pipe setup and transfer results are checked, every
+  accepted DMAP or mdbg write is read back, and single/multi-write replies
+  expose failure. Low-byte-`0xFF` transfers use a preserve-and-shift workaround
+  for FW 10.01; its adjacent byte must remain stable during the operation.
 - **List virtual memory maps** - ranges, protections, backing names.
 - **Query process metadata** - name, path, titleId, contentId.
 - **Identify the foreground app** (`0xBDDD0006`) - returns pid + titleid +
@@ -330,7 +334,8 @@ citations.
 
 ## Building
 
-Prerequisites (Ubuntu / Debian):
+Release builds require Ubuntu 22.04 and Clang/LLD 18.1.8. The build script
+checks both before publishing an ELF.
 
 ```sh
 sudo apt install bash clang-18 lld-18
@@ -342,15 +347,21 @@ Build:
 ./build.sh
 ```
 
-This builds the SDK first (one-time, cached), then the debugger, then the
-installer (which embeds the debugger), then publishes `ps5debug-NG.elf` at
-the top level. Subsequent runs only rebuild what changed.
+This builds the SDK first (one-time, cached), then force-rebuilds the debugger
+and installer, and publishes `ps5debug-NG.elf` at the top level. The branding
+contains a 16-hex source/configuration fingerprint.
 
-Clean (including the SDK install):
+Forced-path diagnostic builds isolate either write engine:
 
 ```sh
-./build.sh clean
+WRITE_DIAG=1 WRITE_PATH=1 ./build.sh  # DMAP only
+WRITE_DIAG=1 WRITE_PATH=2 ./build.sh  # mdbg only
 ```
+
+Set `WRITE_DIAG=1` only when a full debugger write trace is required. The
+bootstrap installer always stays quiet, and stock builds log failures only.
+`WRITE_PATH=0` is the normal automatic policy. `./build.sh clean` is disabled;
+clean `debugger/` or `installer/` with `make clean` when required.
 
 ---
 
@@ -362,7 +373,7 @@ elfldr from etaHEN-class loaders).
 You should see a system notification confirming the payload is alive:
 
 ```
-ps5debug-NG by OSR v1.3.1 loaded!
+ps5debug-NG by OSR v1.3.2 [<build fingerprint>] loaded!
 Firmware: 9.00
 Coded by OpenSourcereR
 Special thanks to
@@ -439,14 +450,13 @@ The vendored SDK is **ps5-payload-sdk v0.38** (commit
 `6ae1470fd50c5791e8a8bb728627e657e36eb55a`, dated 2026-04-02). Upstream:
 https://github.com/ps5-payload-dev/sdk
 
-To upgrade the SDK:
+To upgrade the SDK, replace the vendored source while preserving its symlinks,
+then remove only generated build products:
 
 ```sh
-./build.sh clean
-rm -rf ps5-payload-sdk
-curl -fsSL https://github.com/ps5-payload-dev/sdk/archive/refs/tags/<TAG>.tar.gz \
-  | tar xz -C /tmp
-mv /tmp/sdk-<TAG_WITHOUT_v> ps5-payload-sdk
+make -C debugger clean
+make -C installer clean
+rm -rf ps5-payload-sdk/install
 ./build.sh
 ```
 

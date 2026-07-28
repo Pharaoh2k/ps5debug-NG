@@ -7,7 +7,7 @@ the sources under `debugger/source/`, `common/`, and the client
 value and the on-the-wire value differ (see the bit-swap note in 1.6), both are
 given.
 
-This document reflects `ps5debug-NG v1.3.1` (`common/include/version.h`,
+This document reflects `ps5debug-NG v1.3.2` (`common/include/version.h`,
 `PS5DEBUG_NG_VERSION_STR`). The on-wire **protocol** version reported by
 `CMD_VERSION` is a separate string, currently `"1.3"`.
 
@@ -20,7 +20,7 @@ This document reflects `ps5debug-NG v1.3.1` (`common/include/version.h`,
 | Symbol             | Value                            | Source                                                   |
 |--------------------|----------------------------------|----------------------------------------------------------|
 | protocol version   | `"1.3"`                          | `meta.c` `handle_version` (local `char ver[]="1.3"`)     |
-| branding string    | `"ps5debug-NG by OSR v1.3.1\01.0"` | `version.h` `PS5DEBUG_NG_BRAND_STR` via `meta.c` `handle_branding` (NUL-separated capability level appended - see 2.1) |
+| branding string    | `"ps5debug-NG by OSR v1.3.2 [<fingerprint>]<NUL>1.1"` | `version.h` `PS5DEBUG_NG_BRAND_STR` via `meta.c` `handle_branding` (NUL-separated capability level appended - see 2.1) |
 | `PACKET_MAGIC`     | `0xFFAABBCC`                     | `main.c:50` (local `#define`)                            |
 | broadcast magic    | `0xFFFFAAAA`                     | `main.c` `broadcast_thread` (raw literal)                |
 | auth magic         | `0xBB40E64D`                     | `protocol.h:249` (`CMD_PROC_AUTH_MAGIC`)                 |
@@ -224,16 +224,17 @@ per-namespace `switch` statements. Three opcodes have no symbolic name at all:
 #### `CMD_BRANDING = 0xBD000501`
 - **Request body:** none.
 - **Response:** `uint32_t length`, then `length` bytes: the human branding string
-  (`"ps5debug-NG by OSR v1.3.1"`), a single `NUL`, then a **capability level**
-  string (`"1.0"`), with no trailing NUL. No status word precedes it. (The client
+  (`"ps5debug-NG by OSR v1.3.2 [<16-hex build fingerprint>]"`), a single `NUL`,
+  then a **capability level**
+  string (`"1.1"`), with no trailing NUL. No status word precedes it. (The client
   calls this `CMD_EXT_VERSION`.)
-- **Capability level:** C-string clients read up to the first `NUL` and see only
-  the unchanged brand; capability-aware clients read the bytes past the `NUL` to
+- **Capability level:** C-string clients read up to the first `NUL` and see the
+  human brand plus fingerprint; capability-aware clients read the bytes past it to
   get the level. The level is bumped as the server gains negotiable features (so a
   client can gate a feature on the server advertising at least a given level).
-  Built from `PS5DEBUG_NG_BRAND_STR "\0" "1.0"` in `meta.c` `handle_branding` -
-  the literals are split (`"\0" "1.0"`) so `\0` is a NUL byte, not the octal
-  escape `\01`.
+  Capability `1.0` introduced write-multi and Turbo Scan; `1.1` adds
+  content-verified process writes. Built from
+  `PS5DEBUG_NG_BRAND_STR "\0" "1.1"` in `meta.c` `handle_branding`.
 
 #### `CMD_PLATFORM_ID = 0xBD000502`
 - **Request body:** none.
@@ -265,8 +266,13 @@ data" is read from the socket by the handler after a leading `CMD_SUCCESS`.
 #### `CMD_PROC_WRITE = 0xBDAA0003` (`proc.c:563`)
 - **Request body:** `struct cmd_proc_write_packet` (16 bytes).
 - **Response:** `CMD_SUCCESS` (before the data phase), then the server reads
-  `length` bytes in 64 KiB chunks, then `CMD_SUCCESS` again. **Two** status
-  words (see 8).
+  `length` bytes in 64 KiB chunks, then `CMD_SUCCESS` only if every chunk was
+  written successfully; otherwise the second status is `CMD_ERROR`. **Two**
+  status words (see 8). DMAP and mdbg writes are read back before acceptance;
+  a proven DMAP mismatch never falls through to mdbg. A transfer starting at
+  an address whose low byte is `0xFF` preserves the preceding byte and starts
+  at `...FE`. This is an adjacent-byte read-modify-write: callers need a stable
+  or suspended target when that preceding byte can mutate concurrently.
 
 #### `0xBDAACC04` (`proc_write_multi_handle`)
 Bulk write - the write counterpart to `0xBDAACC03` (bulk read). Collapses a
@@ -281,14 +287,14 @@ by `proc_handle`; **not** auth-gated (mirrors single write).
 - **Response:** `CMD_SUCCESS` (ack), then the server reads and applies each entry
   (writing via the same DMAP / mdbg path as `CMD_PROC_WRITE`, in 64 KiB chunks).
   If `flags` bit 0 was set, it then sends a `count`-byte status array (one byte per
-  entry, `0` = ok, `1` = write failed). Finally a trailing `CMD_SUCCESS`. **Two**
+  entry: `0` = ok; `1` = invalid; `2` = DMAP failure; `3` = content verification
+  failure; `4` = mdbg failure). It then sends a trailing `CMD_SUCCESS`. **Two**
   status words, plus the optional status array between them.
 - **Semantics:** best-effort and non-atomic - entries are applied in order and a
-  failed entry does not stop the rest. Without the status flag, individual write
-  failures are not reported (same as single `CMD_PROC_WRITE`, whose underlying
-  `proc_write_mem` is `void`). A `count`/`length` cap violation makes the server
-  reply `CMD_ERROR` and abort the command (the connection's stream is then
-  untrustworthy; well-behaved clients stay within the caps).
+  failed entry does not stop the rest. Without the status flag, any failed entry
+  makes the trailing status `CMD_ERROR`. A `count`/`length` cap violation makes
+  the server reply `CMD_ERROR` and abort the command (the connection's stream is
+  then untrustworthy; well-behaved clients stay within the caps).
 
 #### `CMD_PROC_MAPS = 0xBDAA0004` (`proc.c:597`)
 - **Request body:** `struct cmd_proc_maps_packet` (4 bytes, `pid`).
@@ -1062,7 +1068,7 @@ patches applied at install time:
 |--------------------------------------|----------------------------------------------------------------------------|
 | Process enumeration (`CMD_PROC_LIST`)| Walk the kernel `allproc` linked list with `kernel_copyout_fast` (`proc.c` `proc_list_handle`). |
 | Target memory read                   | `sys_proc_rw_w0` (mdbg), with a DMAP page-table-walk read for Sony-aux regions (`proc.c` `proc_read_mem`). |
-| Target memory write                  | DMAP page-table-walk write on FW >= 8.40 (mdbg write is `EPERM`-gated there), mdbg `sys_proc_rw_w1` otherwise (`proc.c` `proc_write_mem`). |
+| Target memory write                  | Content-verified DMAP page-table-walk write on FW >= 8.40, with an independently read-back mdbg fallback; low-byte-`0xFF` starts are preserve-and-shift normalized (`proc.c`, `kern_rw_fast.c`, `sys_proc_rw.c`). |
 | `mprotect` / alloc / free / call / ELF | `sys_proc_cmd` syscall variants (`kdbg.h` `SYS_PROC_*`). |
 | Kernel base / kernel R/W             | `KERNEL_ADDRESS_DATA_BASE`, `kernel_copyout_fast` / `kernel_copyin_fast` (`kern.c`). |
 | VM map (`CMD_PROC_MAPS`)             | Read `vmspace` + map entries via `kernel_copyout_fast`, augmented by a page-table walk (`scan.c` `sys_proc_vm_map`, `proc_ptwalk_augment`). |
@@ -1349,7 +1355,7 @@ Documented so a developer does not mistake them for bugs:
 
 ---
 
-*This document reflects the `ps5debug-NG v1.3.1` payload
+*This document reflects the `ps5debug-NG v1.3.2` payload
 (`common/include/version.h`; v1.3.1 added the Turbo Scan cancel command `0xBDAACC17`).
 Line numbers cite the sources as of this writing
 and may drift; the source under `common/include/protocol.h`,
