@@ -20,6 +20,13 @@ CFLAGS  := -Wall -O2 -I../common/include -ffunction-sections -fdata-sections
 LDFLAGS := -Wl,--gc-sections
 LDLIBS  := -lSceLibcInternal -lkernel_sys -lSceNet -lSceNetCtl -lSceSysCore
 
+WRITE_DIAG        ?= 0
+WRITE_PATH        ?= 0
+BUILD_FINGERPRINT ?= unfingerprinted
+CFLAGS += -DPS5DEBUG_WRITE_DIAGNOSTICS=$(WRITE_DIAG)
+CFLAGS += -DPS5DEBUG_FORCE_WRITE_PATH=$(WRITE_PATH)
+CFLAGS += -DPS5DEBUG_NG_BUILD_FINGERPRINT_STR=\"$(BUILD_FINGERPRINT)\"
+
 CFILES := $(wildcard ../common/source/*.c) $(wildcard source/*.c)
 
 all: $(ELF)

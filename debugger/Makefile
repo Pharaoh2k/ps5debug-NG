@@ -21,6 +21,13 @@ CFLAGS  := -Wall -O2 -I../common/include -Iinclude -I$(ZYDIR) -I$(KSDIR)/include
 LDFLAGS := -Wl,--wrap=__patch_init
 LDLIBS  := -lSceLibcInternal -lkernel_sys -lSceNet -lSceNetCtl -lSceSysCore
 
+WRITE_DIAG       ?= 0
+WRITE_PATH       ?= 0
+BUILD_FINGERPRINT ?= unfingerprinted
+CFLAGS += -DPS5DEBUG_WRITE_DIAGNOSTICS=$(WRITE_DIAG)
+CFLAGS += -DPS5DEBUG_FORCE_WRITE_PATH=$(WRITE_PATH)
+CFLAGS += -DPS5DEBUG_NG_BUILD_FINGERPRINT_STR=\"$(BUILD_FINGERPRINT)\"
+
 ZYDIS_CFLAGS := -O3 -DNDEBUG -DZYAN_NO_LIBC -w -I../common/include -Iinclude -I$(ZYDIR)
 
 CXXFILES   := $(wildcard source/*.cpp)

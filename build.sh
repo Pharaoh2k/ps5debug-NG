@@ -9,6 +9,53 @@ cd "$SCRIPT_DIR"
 SDK_SRC="$SCRIPT_DIR/ps5-payload-sdk"
 SDK_INSTALL="$SDK_SRC/install"
 ARTIFACT="$SCRIPT_DIR/ps5debug-NG.elf"
+WRITE_DIAG_MODE="${WRITE_DIAG:-0}"
+WRITE_PATH_MODE="${WRITE_PATH:-0}"
+
+compute_build_fingerprint() {
+    local manifest source_fingerprint
+    manifest="$(mktemp)"
+    if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree \
+            >/dev/null 2>&1; then
+        (
+            cd "$SCRIPT_DIR"
+            git ls-files -co --exclude-standard -z -- \
+                build.sh common debugger installer |
+                LC_ALL=C sort -z
+        ) > "$manifest"
+    else
+        (
+            cd "$SCRIPT_DIR"
+            find build.sh common debugger installer -type f \
+                ! -path '*/build/*' -print0 |
+                LC_ALL=C sort -z
+        ) > "$manifest"
+    fi
+    if [ ! -s "$manifest" ]; then
+        rm -f "$manifest"
+        echo "ERROR: no payload sources found for build fingerprint." >&2
+        return 1
+    fi
+    source_fingerprint="$(
+        (cd "$SCRIPT_DIR"; xargs -0 sha256sum < "$manifest") |
+        sha256sum | cut -c1-64
+    )"
+    rm -f "$manifest"
+    printf '%s diag=%s path=%s\n' \
+        "$source_fingerprint" "$WRITE_DIAG_MODE" "$WRITE_PATH_MODE" |
+        sha256sum | cut -c1-16
+}
+
+validate_write_build_mode() {
+    case "$WRITE_DIAG_MODE" in
+        0|1) ;;
+        *) echo "ERROR: WRITE_DIAG must be 0 or 1." >&2; exit 1 ;;
+    esac
+    case "$WRITE_PATH_MODE" in
+        0|1|2) ;;
+        *) echo "ERROR: WRITE_PATH must be 0 (auto), 1 (DMAP), or 2 (mdbg)." >&2; exit 1 ;;
+    esac
+}
 
 require_build_host() {
     # This payload's release bytes are toolchain-sensitive.  Keep the supported
@@ -26,6 +73,19 @@ verify_sdk_links() {
     # with core.symlinks=false turns them into one-line regular files that the C
     # compiler then parses as source text.
     local rel target
+    if ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree \
+            >/dev/null 2>&1; then
+        while IFS= read -r -d '' rel; do
+            if [ ! -e "$SCRIPT_DIR/$rel" ]; then
+                echo "ERROR: required SDK symlink is broken: $rel" >&2
+                exit 1
+            fi
+        done < <(
+            cd "$SCRIPT_DIR"
+            find ps5-payload-sdk/include/freebsd -type l -print0
+        )
+        return
+    fi
     while IFS= read -r rel; do
         [ -z "$rel" ] && continue
         if [ ! -L "$SCRIPT_DIR/$rel" ]; then
@@ -53,14 +113,6 @@ verify_toolchain() {
     fi
 }
 
-clean_build() {
-    echo "==> cleaning"
-    (cd debugger  && make clean) || true
-    (cd installer && make clean) || true
-    (cd "$SDK_SRC" && make clean) || true
-    rm -rf "$SDK_INSTALL" "$ARTIFACT"
-}
-
 build_sdk() {
     if [ ! -f "$SDK_INSTALL/toolchain/prospero.mk" ]; then
         echo "==> building SDK (one-time, ~30s)"
@@ -72,13 +124,21 @@ build_sdk() {
 }
 
 build_debugger() {
-    echo "==> building debugger"
-    make -C debugger
+    local fingerprint="$1"
+    echo "==> building debugger (fingerprint $fingerprint)"
+    make -B -C debugger \
+        BUILD_FINGERPRINT="$fingerprint" \
+        WRITE_DIAG="$WRITE_DIAG_MODE" \
+        WRITE_PATH="$WRITE_PATH_MODE"
 }
 
 build_installer() {
+    local fingerprint="$1"
     echo "==> building installer (embeds debugger)"
-    make -C installer
+    make -B -C installer \
+        BUILD_FINGERPRINT="$fingerprint" \
+        WRITE_DIAG=0 \
+        WRITE_PATH="$WRITE_PATH_MODE"
 }
 
 publish_artifact() {
@@ -93,9 +153,11 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 require_build_host
+validate_write_build_mode
 verify_sdk_links
 build_sdk
 verify_toolchain
-build_debugger
-build_installer
+BUILD_FINGERPRINT="$(compute_build_fingerprint)"
+build_debugger "$BUILD_FINGERPRINT"
+build_installer "$BUILD_FINGERPRINT"
 publish_artifact

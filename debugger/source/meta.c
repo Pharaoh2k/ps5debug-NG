@@ -25,12 +25,8 @@ int handle_version(int fd, struct cmd_packet *packet) {
 
 int handle_branding(int fd, struct cmd_packet *packet) {
     (void)packet;
-    /* Human brand, a NUL, then the capability LEVEL. C-string clients stop at the
-       NUL so the displayed brand is unchanged; capability-aware clients read the
-       level past it. NOTE: the literals are split ("\0" "1.0") on purpose - "\01.0"
-       would be parsed as the octal escape \01, not a NUL followed by "1.0". Bump the
-       level (and add the feature on the client) as new capabilities are added. */
-    static const char brand[] = PS5DEBUG_NG_BRAND_STR "\0" "1.0";
+    /* Capability 1.1 adds content-verified process writes. */
+    static const char brand[] = PS5DEBUG_NG_BRAND_STR "\0" "1.1";
     uint32_t len = (uint32_t)(sizeof(brand) - 1);
     net_send_all(fd, &len, sizeof(uint32_t));
     net_send_all(fd, brand, (int)len);
