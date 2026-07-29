@@ -360,9 +360,16 @@ static void debug_clear_breakpoint_slots(void *svc) {
     }
 }
 
+static void debug_clear_watchpoint_shadow(void *svc) {
+    if (!svc) return;
+
+    memset((char *)svc + 0x2D8, 0, DBREG_BLOB_SIZE);
+}
+
 void debug_full_teardown(void *svc) {
     if (!g_debug_attached) {
         debug_clear_breakpoint_slots(svc);
+        debug_clear_watchpoint_shadow(svc);
         g_debug_pending_wait_valid = 0;
         g_debug_pending_wait_pid = 0;
         g_debug_pending_wait_status = 0;
@@ -520,6 +527,7 @@ close_socket_and_unlock:
        every slot after any live-target restores, including the dead-target
        liveness-failure path, so a later arm cannot match stale state. */
     debug_clear_breakpoint_slots(svc);
+    debug_clear_watchpoint_shadow(svc);
 
     g_debug_pending_wait_valid = 0;
     g_debug_pending_wait_pid = 0;
@@ -1504,6 +1512,9 @@ int dispatch_debug_events(void) {
 
     int matched_wp = -1;
     uint64_t *pkt_dr = (uint64_t *)(pkt + 0x420);
+    /* Internal DBREG writes clear live DR6; retain this event's cause for the client. */
+    uint64_t event_dr6 = pkt_dr[6];
+    bool report_event_dr6 = true;
     for (int i = 0; i < 4; i++) {
         if (pkt_dr[i] != 0 && pkt_dr[i] == pkt_rip) { matched_wp = i; break; }
     }
@@ -1748,6 +1759,7 @@ int dispatch_debug_events(void) {
             DDE_RETURN(0);
         }
         *(uint64_t *)(pkt + 0x420 + 0x30) = 0;
+        report_event_dr6 = false;
     }
     g_stepping_lwpid = 0;
 
@@ -1774,6 +1786,7 @@ int dispatch_debug_events(void) {
     }
 
     g_debug_phase = DEBUG_PHASE_EVENT_STOPPED;
+    if (report_event_dr6) pkt_dr[6] = event_dr6;
     if (net_send_all(DBGCTX()->dbgfd, pkt, 1184) < 0) {
         g_debug_phase = DEBUG_PHASE_BROKEN;
         DDE_RETURN(1);
