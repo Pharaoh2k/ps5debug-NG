@@ -9,7 +9,9 @@ ps5debug-NG is inspired by Ctn's `ps5debug 1.0b5` and is wire-compatible with
 it - existing clients should work without modification. It is licensed under
 GPL-3.
 
-Discord Server: [Team Reaper](https://discord.gg/7bjtgZf4PY)
+## Discord Server: [Team Reaper](https://discord.gg/7bjtgZf4PY)
+
+## Official PlayStation 4 version [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG)
 
 ---
 
