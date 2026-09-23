@@ -32,7 +32,7 @@ aborts cleanly.
 | 10.xx  | 10.00, 10.01, 10.20, 10.40, 10.60               | Fully Verified                            |
 | 11.xx  | 11.00, 11.20, 11.40, 11.60                      | Fully Verified                            |
 | 12.xx  | 12.00, 12.02, 12.20, 12.40, 12.60, 12.70        | Fully Verified                            |
-| 13.xx  | 13.00, 13.20                                    | Fully Verified                            |
+| 13.xx  | 13.00, 13.20, 13.40, 13.42, 13.60               | Fully Verified                            |
 
 The point releases above are the exact FW magic values recognised by the switch
 in [installer/source/main.c](installer/source/main.c); that file is the source

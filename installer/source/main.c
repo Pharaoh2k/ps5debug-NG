@@ -137,9 +137,14 @@ static int install_kernel_patch(void)
         patch_addr = kbase + 0xD83088ULL;
         fw_label = "FW 12.x";
         break;
-    case 0x13000000u: case 0x13200000u:                                     /* 13.00 13.20 */
+    case 0x13000000u: case 0x13200000u:
+    case 0x13400000u: case 0x13420000u:                                     /* 13.00 13.20 13.40 13.42 */
         patch_addr = kbase + 0xD99088ULL;
-        fw_label = "FW 13.x";
+        fw_label = "FW 13.0x-13.4x";
+        break;
+    case 0x13600000u:                                                       /* 13.60 */
+        patch_addr = kbase + 0xD9C088ULL;
+        fw_label = "FW 13.60";
         break;
     default:
         klog_printf("port_outer: kpatch SKIP - unsupported FW magic 0x%x\n", fw);
