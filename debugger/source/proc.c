@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+#include "ptr_scan.h"
 #include "protocol.h"
 #include "sdk_shim.h"
 #include "net.h"
@@ -1238,6 +1239,7 @@ int proc_handle(int fd, struct cmd_packet *packet, unsigned char client_idx) {
     case 0xBDAACC15u: return proc_turboscan_config_handle(fd, packet);
     case 0xBDAACC16u: return proc_turboscan_regions_handle(fd, packet);
     case 0xBDAACC17u: return proc_turboscan_cancel_handle(fd, packet);
+    case 0xBDAACC30u: return proc_ptrscan_handle(fd, packet);
     case 0xBDAACC24u: return proc_arena_handle(fd, packet);
     }
 

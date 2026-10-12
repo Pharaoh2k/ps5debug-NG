@@ -3,6 +3,7 @@
 
 #include "scan_turbo.h"
 #include "scan_alias.h"
+#include "ptr_scan.h"
 #include "protocol.h"
 #include "scan_float_policy.h"
 #include "proc.h"
@@ -1377,7 +1378,7 @@ int proc_turboscan_caps_handle(int fd, struct cmd_packet *packet) {
                      | TSE_SNAPSHOT_SEGMENTS | TSE_SNAPSHOT_CONFIG | TSE_SNAPSHOT_FIRST
                      | TSE_SNAPSHOT_PREVIOUS | TSE_ALIASING | TSE_PARALLEL_COMPARE
                      | TSE_RESCAN_ALIASING | TSE_FLOAT_POLICY
-                     | TSE_COMPACT_SIMPLE_SNAPSHOT;
+                     | TSE_COMPACT_SIMPLE_SNAPSHOT | TSE_POINTER_SCAN;
     resp.max_threads = TS_WORKER_THREADS;
     net_send_int32(fd, CMD_SUCCESS);
     net_send_all(fd, &resp, sizeof(resp));
