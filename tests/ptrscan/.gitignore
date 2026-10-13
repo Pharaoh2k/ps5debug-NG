@@ -1,1 +1,3 @@
 harness
+__pycache__/
+*.pyc
