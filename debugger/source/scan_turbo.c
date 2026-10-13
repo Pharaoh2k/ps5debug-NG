@@ -3,7 +3,6 @@
 
 #include "scan_turbo.h"
 #include "scan_alias.h"
-#include "ptr_scan.h"
 #include "protocol.h"
 #include "scan_float_policy.h"
 #include "proc.h"

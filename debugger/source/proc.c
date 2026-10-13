@@ -439,6 +439,10 @@ void proc_read_mem(uint32_t pid, uint64_t addr, uint64_t len, void *buf) {
     (void)proc_read_mem_status(pid, addr, len, buf);
 }
 
+int proc_read_mem_checked(uint32_t pid, uint64_t addr, uint64_t len, void *buf) {
+    return proc_read_mem_status(pid, addr, len, buf);
+}
+
 static int proc_verify_mem_exact(uint32_t pid, uint64_t addr,
                                  uint64_t len, const void *expected,
                                  int diagnostic) {

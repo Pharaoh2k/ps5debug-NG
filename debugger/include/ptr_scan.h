@@ -7,36 +7,42 @@
 // client's sorted "frontier".  The client walks level by level (target -> pointers
 // to it -> pointers to those ...), so only the matches ever cross the network.
 //
-// Request  (packet data, 24 bytes): struct cmd_proc_ptrscan_packet
+// Request  (packet data, 24 bytes): struct cmd_proc_ptrscan_packet (protocol.h)
+//          rejected with CMD_DATA_NULL (connection stays open): not authed, unknown flag bits,
+//          bad limits, out of memory
 // Reply    CMD_SUCCESS                         (header accepted)
 //          <- client sends nseg x {u64 addr; u64 len}, then nfront x u64 (ascending)
-//          CMD_SUCCESS | CMD_DATA_NULL          (inputs accepted / rejected)
+//          CMD_SUCCESS | CMD_DATA_NULL          (inputs accepted / rejected: a segment wraps or
+//                                                ends above 0x800000000000, frontier not ascending)
 //          stream of blocks:  u32 n;  n x {u64 slot_addr; u64 value}
 //                             n == 0xFFFFFFFF -> progress: u64 bytes_done, u64 bytes_total
 //                             n == 0          -> end
-//          u64 total_hits; u64 bytes_scanned; u32 status (0 ok, 1 cancelled, 2 hit cap)
+//          u64 total_hits; u64 bytes_scanned; u64 bytes_unreadable;
+//          u32 status (0 ok, 1 cancelled, 2 hit cap)
 //          CMD_SUCCESS
-// Cancel:  0xBDAACC17 (turbo cancel) for the same pid, from another connection.
+//          bytes_unreadable > 0: pages that could not be read were skipped (pass incomplete).
+// Cancel:  0xBDAACC17 (turbo cancel) for the same pid, from another connection - one cancel
+//          stops a running turbo scan and a pointer scan of that pid (they share the flag).
+// A client that disconnects mid-pass stops it: the handler returns 1 and the connection closes.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include "protocol.h"
 
 #define PTRSCAN_FLAG_ALIAS     0x1u      /* use the aliasing read engine (falls back to mdbg per chunk) */
+#define PTRSCAN_FLAGS_KNOWN    PTRSCAN_FLAG_ALIAS   /* other bits are rejected */
+
+#define PTRSCAN_ST_OK          0u
+#define PTRSCAN_ST_CANCELLED   1u
+#define PTRSCAN_ST_CAPPED      2u
 
 #define PTRSCAN_MAX_FRONT      (8u << 20)   /* 8M addresses (64 MB) */
 #define PTRSCAN_MAX_SEGS       65536u
 #define PTRSCAN_MAX_OFF        0x100000ULL  /* 1 MB */
 #define PTRSCAN_MAX_HITS       (64ULL << 20)
 
-#define TSE_POINTER_SCAN       0x00001000u  /* CAPS engine bit: 0xBDAACC30 is available */
-
-struct cmd_proc_ptrscan_packet {
-    uint32_t pid;
-    uint32_t flags;
-    uint64_t max_off;
-    uint32_t nseg;
-    uint32_t nfront;
-} __attribute__((packed));
+/* The request header (struct cmd_proc_ptrscan_packet) and the CAPS bit TSE_POINTER_SCAN live
+ * in protocol.h with the rest of the TURBOSCAN family. */
 
 /* ---- core (pure C, no console APIs - unit-testable on a PC) ---- */
 #define PTRSCAN_BM_BITS   27u                       /* bitmap over (value >> 12): 2^27 bits = 16 MB */

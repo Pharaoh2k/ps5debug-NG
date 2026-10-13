@@ -201,7 +201,7 @@ intentional.
 
 ## 2. Command reference
 
-69 opcodes have handlers. Only a handful are given `CMD_*` macros in
+70 opcodes have handlers. Only a handful are given `CMD_*` macros in
 `protocol.h` (`CMD_VERSION`, `CMD_FW_VERSION`, `CMD_BRANDING`, `CMD_PLATFORM_ID`,
 `CMD_PROC_NOP`, `CMD_DEBUG_ATTACH`, `CMD_DEBUG_SET_BREAKPOINT`,
 `CMD_DEBUG_SET_WATCHPOINT`); the rest are bare hex literals inside the
@@ -807,18 +807,26 @@ engine bit `TSE_POINTER_SCAN` (`0x1000`). Raw literal (no `CMD_*` macro).
   `max_off` <= 1 MiB.
 - **Response:**
   1. `CMD_SUCCESS` (header accepted) - or `CMD_DATA_NULL` (not authed / short body /
-     limits / out of memory); a rejection here keeps the connection open and logs the
-     reason to klog (`[ps5debug-NG ptrscan] ...`).
+     unknown `flags` bits / limits / out of memory); a rejection here keeps the connection
+     open and logs the reason to klog (`[ps5debug-NG ptrscan] ...`).
   2. Client sends `nseg x {u64 addr; u64 len}` then `nfront x u64` (ascending).
-  3. `CMD_SUCCESS` (inputs accepted) - or `CMD_DATA_NULL` (frontier not ascending, or the
-     receive failed; the latter closes the connection).
+  3. `CMD_SUCCESS` (inputs accepted) - or `CMD_DATA_NULL` (a segment wraps past 2^64 or ends
+     above `0x800000000000`, or the frontier is not ascending; the connection stays open).
+     A failed receive closes the connection.
   4. A stream of blocks: `u32 n` then `n x {u64 slot_addr; u64 value}`;
      `n == 0xFFFFFFFF` is a progress record `{u64 bytes_done; u64 bytes_total}` (every
      256 MiB); `n == 0` ends the stream.
-  5. Trailer `u64 total_hits; u64 bytes_scanned; u32 status` (`0` ok, `1` cancelled,
-     `2` stopped at `PTRSCAN_MAX_HITS` = 64M hits), then `CMD_SUCCESS`.
+  5. Trailer `u64 total_hits; u64 bytes_scanned; u64 bytes_unreadable; u32 status`
+     (`0` ok, `1` cancelled, `2` stopped at `PTRSCAN_MAX_HITS` = 64M hits, also when the cap
+     is reached in the last chunk), then `CMD_SUCCESS`.
+- **Unreadable memory:** a chunk whose read fails is retried in 4 KiB pages; pages that still
+  fail are skipped and counted in `bytes_unreadable`, not in `bytes_scanned`. A pass with
+  `bytes_unreadable > 0` is incomplete.
+- **Client gone:** if a send fails or the client closes the socket, the pass stops, its
+  buffers are released and the handler returns nonzero, so the connection is closed.
 - **Cancel:** `0xBDAACC17` for the same pid on a second connection; the pass stops at the
-  next 1 MiB chunk and sends its normal trailer with `status = 1`.
+  next 1 MiB chunk and sends its normal trailer with `status = 1`. Turbo scan and pointer
+  scan share the cancel flag, so one `0xBDAACC17` stops both on that pid.
 - **Matching:** a range check `[f[0] - max_off, f[n-1]]`, then a 16 MiB bitmap over
   `value >> 12` (pages covered by any `[f - max_off, f]`), then a binary search in the
   frontier. Large buffers come from `mmap` (syscall 477), like the snapshot store. The
@@ -1158,8 +1166,8 @@ Auth = requires `g_proc_auth_state & 2` (set via `CMD_PROC_AUTH`).
 | `0xBDAACC15` | `proc_turboscan_config_handle`    | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC16` | `proc_turboscan_regions_handle`   | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC17` | `proc_turboscan_cancel_handle`    | `scan_turbo.c`            | bit 1 |
-| `0xBDAACC30` | `proc_ptrscan_handle`             | `ptr_scan.c`              | bit 1 |
 | `0xBDAACC24` | `proc_arena_handle`              | `proc.c`                 |       |
+| `0xBDAACC30` | `proc_ptrscan_handle`             | `ptr_scan.c`              | bit 1 |
 | `0xBDBB0001` | `debug_attach_handle`            | `debug.c`                |       |
 | `0xBDBB0002` | `debug_detach_handle`            | `debug.c`                |       |
 | `0xBDBB0003` | `debug_set_breakpoint_handle`    | `debug.c`                |       |

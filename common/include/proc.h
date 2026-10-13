@@ -145,4 +145,6 @@ int proc_ptwalk_write(uint32_t pid, uint64_t va, uint64_t len, const void *src);
 int proc_aux_range_contains(uint32_t pid, uint64_t addr, uint64_t len);
 
 void proc_read_mem(uint32_t pid, uint64_t addr, uint64_t len, void *buf);
+/* 0 = all `len` bytes read; nonzero = failed or short read (`buf` contents undefined) */
+int proc_read_mem_checked(uint32_t pid, uint64_t addr, uint64_t len, void *buf);
 int proc_write_mem(uint32_t pid, uint64_t addr, uint64_t len, const void *buf);
