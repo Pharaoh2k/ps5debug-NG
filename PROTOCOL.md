@@ -824,6 +824,8 @@ engine bit `TSE_POINTER_SCAN` (`0x1000`). Raw literal (no `CMD_*` macro).
   `bytes_unreadable > 0` is incomplete.
 - **Client gone:** if a send fails or the client closes the socket, the pass stops, its
   buffers are released and the handler returns nonzero, so the connection is closed.
+  The check reads the socket, so a client must **keep its write side open** while it receives
+  results: a write-side `shutdown()` (half-close) looks the same as a disconnect and stops the pass.
 - **Cancel:** `0xBDAACC17` for the same pid on a second connection; the pass stops at the
   next 1 MiB chunk and sends its normal trailer with `status = 1`. Turbo scan and pointer
   scan share the cancel flag, so one `0xBDAACC17` stops both on that pid.

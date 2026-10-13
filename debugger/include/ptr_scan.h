@@ -24,6 +24,8 @@
 // Cancel:  0xBDAACC17 (turbo cancel) for the same pid, from another connection - one cancel
 //          stops a running turbo scan and a pointer scan of that pid (they share the flag).
 // A client that disconnects mid-pass stops it: the handler returns 1 and the connection closes.
+// The client must keep its write side open while receiving: a half-close (shutdown(SHUT_WR))
+// reads as EOF and is treated as a disconnect.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
