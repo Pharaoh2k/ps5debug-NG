@@ -201,7 +201,7 @@ intentional.
 
 ## 2. Command reference
 
-69 opcodes have handlers. Only a handful are given `CMD_*` macros in
+70 opcodes have handlers. Only a handful are given `CMD_*` macros in
 `protocol.h` (`CMD_VERSION`, `CMD_FW_VERSION`, `CMD_BRANDING`, `CMD_PLATFORM_ID`,
 `CMD_PROC_NOP`, `CMD_DEBUG_ATTACH`, `CMD_DEBUG_SET_BREAKPOINT`,
 `CMD_DEBUG_SET_WATCHPOINT`); the rest are bare hex literals inside the
@@ -563,6 +563,7 @@ and request flags are in `protocol.h:22-37`.
 | `0x200` | `TSE_RESCAN_ALIASING`  | `TS_RESCAN_ALIASING` supported (CC12 rescan reads full-size survivor windows via the aliasing engine) |
 | `0x400` | `TSE_FLOAT_POLICY`     | server applies the negotiated Simple/exact float policy during START, snapshot seed, and all COUNT paths |
 | `0x800` | `TSE_COMPACT_SIMPLE_SNAPSHOT` | a float/double snapshot seeded with `TS_FLOAT_SIMPLE` filters before storage and keeps survivor records only |
+| `0x1000` | `TSE_POINTER_SCAN` | `0xBDAACC30` pointer-scan level supported |
 
 **Per-request flags** (`START` / `COUNT` `flags` field):
 
@@ -791,6 +792,47 @@ connection then unblocks. Raw literal (no `CMD_*` macro).
 - **Staleness:** a cancel arriving before the scan starts is discarded (`START`/`COUNT`
   clear a stale same-pid flag on entry), so only a running scan can be cancelled. The
   client-driven streaming `COUNT` is already stoppable via its end sentinel and is unaffected.
+
+##### `0xBDAACC30` - pointer-scan level (`proc_ptrscan_handle`, `ptr_scan.c`) - **requires auth bit 1**
+One server-side pass of a reverse pointer scan. The client walks a pointer graph level by
+level (target -> slots pointing just below it -> slots pointing just below those ...); each
+level is one call that reports every **8-byte aligned** slot in the given segments whose
+value `v` satisfies `f - max_off <= v <= f` for some address `f` of the client's sorted
+*frontier*. Only matching `(slot, value)` pairs cross the network. Advertised by the CAPS
+engine bit `TSE_POINTER_SCAN` (`0x1000`). Raw literal (no `CMD_*` macro).
+- **Request body:** `struct cmd_proc_ptrscan_packet` (24 bytes, `protocol.h`):
+  `u32 pid; u32 flags; u64 max_off; u32 nseg; u32 nfront;`. `flags` bit 0
+  (`PTRSCAN_FLAG_ALIAS`) reads through the aliasing engine (per-chunk fallback to
+  `proc_read_mem`). Limits (`ptr_scan.h`): `nseg` 1..65536, `nfront` 1..8M,
+  `max_off` <= 1 MiB.
+- **Response:**
+  1. `CMD_SUCCESS` (header accepted) - or `CMD_DATA_NULL` (not authed / short body /
+     unknown `flags` bits / limits / out of memory); a rejection here keeps the connection
+     open and logs the reason to klog (`[ps5debug-NG ptrscan] ...`).
+  2. Client sends `nseg x {u64 addr; u64 len}` then `nfront x u64` (ascending).
+  3. `CMD_SUCCESS` (inputs accepted) - or `CMD_DATA_NULL` (a segment wraps past 2^64 or ends
+     above `0x800000000000`, or the frontier is not ascending; the connection stays open).
+     A failed receive closes the connection.
+  4. A stream of blocks: `u32 n` then `n x {u64 slot_addr; u64 value}`;
+     `n == 0xFFFFFFFF` is a progress record `{u64 bytes_done; u64 bytes_total}` (every
+     256 MiB); `n == 0` ends the stream.
+  5. Trailer `u64 total_hits; u64 bytes_scanned; u64 bytes_unreadable; u32 status`
+     (`0` ok, `1` cancelled, `2` stopped at `PTRSCAN_MAX_HITS` = 64M hits, also when the cap
+     is reached in the last chunk), then `CMD_SUCCESS`.
+- **Unreadable memory:** a chunk whose read fails is retried in 4 KiB pages; pages that still
+  fail are skipped and counted in `bytes_unreadable`, not in `bytes_scanned`. A pass with
+  `bytes_unreadable > 0` is incomplete.
+- **Client gone:** if a send fails or the client closes the socket, the pass stops, its
+  buffers are released and the handler returns nonzero, so the connection is closed.
+  The check reads the socket, so a client must **keep its write side open** while it receives
+  results: a write-side `shutdown()` (half-close) looks the same as a disconnect and stops the pass.
+- **Cancel:** `0xBDAACC17` for the same pid on a second connection; the pass stops at the
+  next 1 MiB chunk and sends its normal trailer with `status = 1`. Turbo scan and pointer
+  scan share the cancel flag, so one `0xBDAACC17` stops both on that pid.
+- **Matching:** a range check `[f[0] - max_off, f[n-1]]`, then a 16 MiB bitmap over
+  `value >> 12` (pages covered by any `[f - max_off, f]`), then a binary search in the
+  frontier. Large buffers come from `mmap` (syscall 477), like the snapshot store. The
+  matching core (`ptr_scan_core.c`) has no console dependencies.
 
 ##### Snapshot sub-protocol (`CC11 + TS_SNAPSHOT`, narrowed by `CC12 + TS_SERVER_RESIDENT`)
 For unknown-initial-value scans. **By default the seed drops all-zero slots** (most
@@ -1127,6 +1169,7 @@ Auth = requires `g_proc_auth_state & 2` (set via `CMD_PROC_AUTH`).
 | `0xBDAACC16` | `proc_turboscan_regions_handle`   | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC17` | `proc_turboscan_cancel_handle`    | `scan_turbo.c`            | bit 1 |
 | `0xBDAACC24` | `proc_arena_handle`              | `proc.c`                 |       |
+| `0xBDAACC30` | `proc_ptrscan_handle`             | `ptr_scan.c`              | bit 1 |
 | `0xBDBB0001` | `debug_attach_handle`            | `debug.c`                |       |
 | `0xBDBB0002` | `debug_detach_handle`            | `debug.c`                |       |
 | `0xBDBB0003` | `debug_set_breakpoint_handle`    | `debug.c`                |       |

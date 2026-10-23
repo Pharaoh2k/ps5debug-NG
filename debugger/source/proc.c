@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+#include "ptr_scan.h"
 #include "protocol.h"
 #include "sdk_shim.h"
 #include "net.h"
@@ -436,6 +437,10 @@ static int proc_read_mem_status(uint32_t pid, uint64_t addr,
 
 void proc_read_mem(uint32_t pid, uint64_t addr, uint64_t len, void *buf) {
     (void)proc_read_mem_status(pid, addr, len, buf);
+}
+
+int proc_read_mem_checked(uint32_t pid, uint64_t addr, uint64_t len, void *buf) {
+    return proc_read_mem_status(pid, addr, len, buf);
 }
 
 static int proc_verify_mem_exact(uint32_t pid, uint64_t addr,
@@ -1238,6 +1243,7 @@ int proc_handle(int fd, struct cmd_packet *packet, unsigned char client_idx) {
     case 0xBDAACC15u: return proc_turboscan_config_handle(fd, packet);
     case 0xBDAACC16u: return proc_turboscan_regions_handle(fd, packet);
     case 0xBDAACC17u: return proc_turboscan_cancel_handle(fd, packet);
+    case 0xBDAACC30u: return proc_ptrscan_handle(fd, packet);
     case 0xBDAACC24u: return proc_arena_handle(fd, packet);
     }
 

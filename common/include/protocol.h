@@ -37,6 +37,7 @@
 #define TSE_RESCAN_ALIASING   0x00000200u     /* TS_RESCAN_ALIASING supported (CC12 rescan reads full-size survivor windows via the aliasing engine) */
 #define TSE_FLOAT_POLICY      0x00000400u     /* TS_FLOAT_SIMPLE / TS_FLOAT_EXACT + packed exponent threshold supported */
 #define TSE_COMPACT_SIMPLE_SNAPSHOT 0x00000800u /* TS_FLOAT_SIMPLE snapshots store survivor records instead of raw-slot-dense backing */
+#define TSE_POINTER_SCAN      0x00001000u     /* 0xBDAACC30 pointer-scan level supported (ptr_scan.c) */
 
 /* TURBOSCAN START/COUNT flags (per-request; opt-in). Phase 1 honored none. */
 #define TS_USE_ALIASING    0x00000001u        /* Phase 3 read engine (client opt-in) */
@@ -278,6 +279,18 @@ struct cmd_proc_turboscan_regions_packet {
     uint32_t max;            /* cap on regions returned (0 => server default) */
     uint32_t probe_bytes;    /* bytes probe-read per region to measure MB/s (0 => 64 KiB) */
     uint32_t reserved;
+} __attribute__((packed));
+
+/* Pointer-scan level (opcode 0xBDAACC30, raw literal, requires auth bit 1): one pass over
+   the client's data segments reporting every 8-byte aligned slot whose value v satisfies
+   f - max_off <= v <= f for some f of the client's ascending frontier. After the header
+   ack the client sends nseg x {u64 addr; u64 len} then nfront x u64. See PROTOCOL.md. */
+struct cmd_proc_ptrscan_packet {
+    uint32_t pid;
+    uint32_t flags;          /* PTRSCAN_FLAG_ALIAS: read through the aliasing engine */
+    uint64_t max_off;        /* <= PTRSCAN_MAX_OFF */
+    uint32_t nseg;           /* 1 .. PTRSCAN_MAX_SEGS */
+    uint32_t nfront;         /* 1 .. PTRSCAN_MAX_FRONT */
 } __attribute__((packed));
 
 struct cmd_proc_turboscan_region_info {

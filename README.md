@@ -326,7 +326,7 @@ citations.
 | Namespace     | Count | Examples                                                   |
 |---------------|-------|------------------------------------------------------------|
 | Info / ping   | 5     | `VERSION`, `FW_VERSION`, `BRANDING`, `PLATFORM_ID`, `NOP`  |
-| Process       | 35    | `READ`, `WRITE`, `MAPS`, `CALL`, `SCAN_*`, `TURBOSCAN_*`, `DISASM_*` |
+| Process       | 36    | `READ`, `WRITE`, `MAPS`, `CALL`, `SCAN_*`, `TURBOSCAN_*`, `PTRSCAN`, `DISASM_*` |
 | Debug         | 20    | `ATTACH`, `SET_BREAKPOINT`, `GETREGS`, `GET_FSGS_BASE`, `STEP`, `CONTINUE` |
 | Kernel R/W    | 3     | `KERN_BASE`, `KERN_READ`, `KERN_WRITE`                     |
 | Console       | 6     | `NOTIFY`, `PRINT`, `REBOOT`, `INFO`, `END`, `FOREGROUND_APP` |
